@@ -7,7 +7,7 @@ from typing import Optional
 
 import numpy as np
 
-from kalman_filter import KalmanFilter
+from src.kalman_filter import KalmanFilter
 
 logger = logging.getLogger(__name__)
 
