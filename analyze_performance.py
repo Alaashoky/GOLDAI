@@ -186,10 +186,11 @@ def print_report(trades: List[dict]) -> None:
     rm = RiskMetrics() if RISK_OK else None
     sharpe = rm.calculate_sharpe(profits.tolist()) if rm else float("nan")
     sortino = rm.calculate_sortino(profits.tolist()) if rm else float("nan")
-    max_dd = rm.calculate_max_drawdown(profits.tolist()) if rm else float("nan")
+    max_dd_result = rm.calculate_max_drawdown(profits.tolist()) if rm else {"max_drawdown": float("nan")}
+    max_dd = max_dd_result["max_drawdown"] if isinstance(max_dd_result, dict) else float(max_dd_result)
     var_95 = rm.calculate_var(profits.tolist(), confidence=0.95) if rm else float("nan")
     cvar_95 = rm.calculate_cvar(profits.tolist(), confidence=0.95) if rm else float("nan")
-    calmar = rm.calculate_calmar(profits.tolist()) if rm else float("nan")
+    calmar = rm.calculate_calmar(profits.tolist(), max_dd) if rm else float("nan")
 
     print(f"\n{'=' * 62}")
     print("  GOLDAI Performance Report")

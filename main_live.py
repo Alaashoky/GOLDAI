@@ -167,7 +167,7 @@ class GoldAIBot:
         self._load_model_if_exists()
 
         # Position management
-        self.position_manager = PositionManager(connector=self.connector)
+        self.position_manager = PositionManager()
 
         # Confidence scoring
         self.confidence_engine = DynamicConfidence(
@@ -259,7 +259,10 @@ class GoldAIBot:
 
         # ML prediction on last row
         X = features_df[feature_cols].tail(1).to_numpy()
-        prediction = self.model.predict(X)[0] if hasattr(self.model, "predict") and self.model._model is not None else PredictionResult()
+        try:
+            prediction = self.model.predict(X)
+        except Exception:  # noqa: BLE001
+            prediction = PredictionResult()
 
         # SMC analysis
         smc_signal = self.smc_analyzer.analyze(h1_df)
@@ -357,7 +360,11 @@ class GoldAIBot:
         # Macro filter
         macro_data = self.macro.get_last_data()
         if macro_data is not None:
-            macro_bias = self.macro.calculate_gold_macro_bias(macro_data)
+            macro_bias = self.macro.calculate_gold_macro_bias(
+                macro_data.dxy_trend,
+                macro_data.yield_trend,
+                macro_data.risk_sentiment,
+            )
             if direction == "BUY" and macro_bias < -0.3:
                 logger.info("Macro bias bearish (%.2f) — skip BUY.", macro_bias)
                 return False
@@ -453,7 +460,13 @@ class GoldAIBot:
                     volatility=getattr(h1_df, "height", 50) / 50.0,
                     smc_signal=0.0,
                 )
-                if self.fuzzy_exit.should_exit(exit_score):
+                if self.fuzzy_exit.should_exit(
+                    profit_pips=getattr(pos, "profit", 0.0),
+                    time_hours=hours_open,
+                    momentum=momentum_result.score if hasattr(momentum_result, "score") else 0.0,
+                    volatility=exit_score.volatility if hasattr(exit_score, "volatility") else 0.5,
+                    smc_score=0.0,
+                ):
                     closed = self.connector.close_order(pos.ticket)
                     if closed:
                         logger.info("Fuzzy exit triggered for ticket %s (score=%.2f)", pos.ticket, exit_score.score)
