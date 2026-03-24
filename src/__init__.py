@@ -1,0 +1,1 @@
+"""GOLDAI - AI-Powered XAUUSD Trading Bot.\n\n__version__ = \"1.0.0\"\n__author__ = \"GOLDAI Team\"""
