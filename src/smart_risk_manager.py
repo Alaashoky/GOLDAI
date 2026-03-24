@@ -265,8 +265,9 @@ class SmartRiskManager:
             symbol = getattr(pos, "symbol", "UNKNOWN")
             lot = getattr(pos, "lot", 0.0)
             exposure[symbol] = exposure.get(symbol, 0.0) + lot
-        exposure["total"] = sum(v for k, v in exposure.items())
-        self._metrics.total_exposure_lots = exposure["total"]
+        total = sum(exposure.values())
+        exposure["total"] = total
+        self._metrics.total_exposure_lots = total
         return exposure
 
     def update_metrics(self, equity: float) -> None:

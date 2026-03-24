@@ -340,7 +340,8 @@ class TradeLogger:
                             exit_time=datetime.fromisoformat(row["exit_time"]) if row["exit_time"] else None,
                         )
                         self._closed_trades.append(record)
-                    except Exception:
+                    except Exception as row_exc:
+                        logger.warning("Skipping malformed CSV row (ticket=%s): %s", row.get("ticket", "?"), row_exc)
                         continue
             logger.info("Loaded %d historical trades from CSV.", len(self._closed_trades))
         except OSError as exc:

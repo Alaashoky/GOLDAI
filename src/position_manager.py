@@ -350,12 +350,10 @@ class PositionManager:
             logger.info("Early exit ticket=%d: %s", position.ticket, reason)
             return True, reason
 
-        # Also exit if the position has been in significant loss (risk management fallback)
-        if position.profit < 0 and abs(position.profit) > 0:
-            loss_pct = abs(position.profit)
-            if loss_pct > 0 and fuzzy_score < 0.3 and smc_signal == opposite:
-                reason = "weak confluence with counter-direction SMC"
-                return True, reason
+        # Also exit when position is underwater and a strong counter-signal is present
+        if position.profit < 0 and fuzzy_score < 0.3 and smc_signal == opposite:
+            reason = "weak confluence with counter-direction SMC"
+            return True, reason
 
         return False, ""
 

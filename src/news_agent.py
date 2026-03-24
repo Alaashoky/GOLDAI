@@ -315,7 +315,8 @@ class NewsAgent:
                         previous=str(item.get("previous", "")),
                     )
                 )
-            except Exception:
+            except Exception as parse_exc:
+                logger.warning("Skipping unparseable calendar event: %s", parse_exc)
                 continue
 
         return events

@@ -245,19 +245,29 @@ class SessionFilter:
         Returns:
             int: Number of events removed.
         """
+        from datetime import timezone as _tz
         now = now or utc_now()
         if now.tzinfo is None:
-            from datetime import timezone
-            now = now.replace(tzinfo=timezone.utc)
+            now = now.replace(tzinfo=_tz.utc)
         before = len(self.news_events)
-        self.news_events = [
-            e for e in self.news_events
-            if (e.blackout_end.replace(tzinfo=None) if e.blackout_end.tzinfo is None else e.blackout_end) >= now
-        ]
+        self.news_events = [e for e in self.news_events if self._aware(e.blackout_end) >= now]
         removed = before - len(self.news_events)
         if removed:
             logger.debug("Removed %d expired news events.", removed)
         return removed
+
+    @staticmethod
+    def _aware(dt: datetime) -> datetime:
+        """Ensure a datetime is timezone-aware (UTC).
+
+        Args:
+            dt: Datetime to normalise.
+
+        Returns:
+            datetime: Timezone-aware UTC datetime.
+        """
+        from datetime import timezone as _tz
+        return dt if dt.tzinfo is not None else dt.replace(tzinfo=_tz.utc)
 
     def get_session_summary(self, now: Optional[datetime] = None) -> Dict[str, object]:
         """Return a human-readable summary of the current session state.
