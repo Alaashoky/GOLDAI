@@ -1,0 +1,62 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+parts/
+var/
+sdist/
+develop-eggs/
+.installed.cfg
+lib/
+lib64/
+.env
+
+# Pytest
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Logs
+logs/
+
+# Data (keep .gitkeep placeholder)
+data/*.csv
+data/*.json
+data/*.db
+data/*.parquet
+
+# Models (keep .gitkeep placeholder)
+models/*.pkl
+models/*.json
+models/*.txt
+
+# Virtual environments
+venv/
+.venv/
+ENV/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node.js (web dashboard)
+web-dashboard/node_modules/
+web-dashboard/.next/
+
+# Docker
+.env.local
