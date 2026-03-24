@@ -1,0 +1,29 @@
+version: "3.8"
+
+services:
+  goldai-bot:
+    build: .
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./logs:/app/logs
+      - ./.env:/app/.env
+    restart: unless-stopped
+
+  goldai-dashboard:
+    build: ./web-dashboard
+    ports:
+      - "3000:3000"
+    depends_on:
+      - goldai-bot
+    environment:
+      - API_URL=http://goldai-api:8000
+
+  goldai-api:
+    build: ./web-dashboard/api
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    restart: unless-stopped
