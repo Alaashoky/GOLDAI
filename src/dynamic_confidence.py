@@ -1,242 +1,266 @@
-"""Dynamic confidence scoring for trade signal aggregation.
+"""
+Dynamic Confidence System
+=========================
+Menyesuaikan confidence threshold berdasarkan kondisi market.
 
-Combines ML model probability, SMC signal strength, market regime,
-session quality, and macro score into a single weighted confidence value.
-Thresholds adapt automatically based on recent accuracy history.
+Prinsip:
+- Market bagus (trending, session bagus) -> threshold lebih rendah (60%)
+- Market jelek (choppy, low liquidity) -> threshold lebih tinggi (75%)
+- Multiple konfirmasi -> threshold lebih rendah
 """
 
-from __future__ import annotations
+from dataclasses import dataclass
+from typing import Optional, Tuple
+from enum import Enum
+from loguru import logger
 
-import logging
-from collections import deque
-from dataclasses import dataclass, field
-from typing import Any, Deque, Dict, List, Optional
 
-logger = logging.getLogger(__name__)
-
-# Default component weights (must sum to 1.0)
-DEFAULT_WEIGHTS: Dict[str, float] = {
-    "ml":      0.35,
-    "smc":     0.30,
-    "regime":  0.15,
-    "session": 0.10,
-    "macro":   0.10,
-}
-
-# Regime quality scores for confidence weighting
-REGIME_SCORES: Dict[str, float] = {
-    "TRENDING": 1.0,
-    "VOLATILE": 0.6,
-    "RANGING":  0.5,
-}
+class MarketQuality(Enum):
+    """Kualitas market untuk trading."""
+    EXCELLENT = "excellent"   # Semua kondisi bagus
+    GOOD = "good"            # Sebagian besar bagus
+    MODERATE = "moderate"    # Biasa saja
+    POOR = "poor"           # Kurang bagus
+    AVOID = "avoid"         # Jangan trading
 
 
 @dataclass
-class ConfidenceRecord:
-    """A single historical confidence prediction with its outcome.
+class MarketAnalysis:
+    """Hasil analisis market."""
+    quality: MarketQuality
+    confidence_threshold: float
+    reasons: list
+    score: int  # 0-100
 
-    Attributes:
-        score: Confidence score at time of prediction (0.0–1.0).
-        was_correct: Whether the trade was profitable.
-        timestamp: Unix timestamp of the prediction.
+
+class DynamicConfidenceManager:
     """
+    Manager untuk menentukan confidence threshold secara dinamis.
 
-    score: float
-    was_correct: bool
-    timestamp: float = 0.0
-
-
-class DynamicConfidence:
-    """Aggregates signals into a single trade confidence score.
-
-    Weights follow the scheme: ML 35%, SMC 30%, Regime 15%,
-    Session 10%, Macro 10%. Thresholds self-adjust based on recent
-    prediction accuracy to avoid overtrading in low-accuracy regimes.
-
-    Attributes:
-        weights: Component weight dictionary.
-        base_threshold: Default confidence threshold for trade entry.
-        history_size: Number of historical records to maintain.
+    Faktor yang dipertimbangkan:
+    1. Session (London-NY overlap = terbaik)
+    2. Regime (medium volatility = ideal)
+    3. Trend clarity (trending > ranging)
+    4. SMC confluence (ada OB/FVG = bonus)
+    5. Spread (rendah = bagus)
     """
 
     def __init__(
         self,
-        weights: Optional[Dict[str, float]] = None,
         base_threshold: float = 0.65,
-        history_size: int = 100,
-    ) -> None:
-        """Initialise the confidence scorer.
+        min_threshold: float = 0.55,
+        max_threshold: float = 0.80,
+    ):
+        self.base_threshold = base_threshold
+        self.min_threshold = min_threshold
+        self.max_threshold = max_threshold
 
-        Args:
-            weights: Optional custom weight dictionary. Must contain keys
-                ml, smc, regime, session, macro summing to 1.0.
-            base_threshold: Starting confidence threshold for high-confidence check.
-            history_size: Rolling window size for accuracy tracking.
-        """
-        self.weights: Dict[str, float] = weights or DEFAULT_WEIGHTS.copy()
-        self.base_threshold: float = base_threshold
-        self._threshold: float = base_threshold
-        self._history: Deque[ConfidenceRecord] = deque(maxlen=history_size)
+        # Track last analysis for logging
+        self._last_quality = "moderate"
+        self._last_score = 50
+        self._last_threshold = base_threshold
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
-    def calculate_confidence(
+    def analyze_market(
         self,
-        ml_prob: float,
-        smc_signal: float,
+        session: str,
         regime: str,
-        session_quality: float,
-        macro_score: float,
-    ) -> float:
-        """Compute the weighted confidence score from raw component values.
-
-        Args:
-            ml_prob: ML model win probability (0.0–1.0).
-            smc_signal: SMC signal strength (0.0–1.0, where 1.0 is strongest).
-            regime: Market regime label; e.g. "TRENDING", "RANGING", "VOLATILE".
-            session_quality: Session suitability score (0.0–1.0).
-            macro_score: Macro/news alignment score (0.0–1.0).
+        volatility: str,
+        trend_direction: str,
+        has_smc_signal: bool,
+        spread: float = 0,
+        ml_signal: str = "",
+        ml_confidence: float = 0,
+    ) -> MarketAnalysis:
+        """
+        Analisis kondisi market dan tentukan threshold yang tepat.
 
         Returns:
-            float: Aggregated confidence score in [0.0, 1.0].
+            MarketAnalysis dengan threshold yang disarankan
         """
-        regime_score = REGIME_SCORES.get(regime, 0.5)
+        score = 50  # Start dari tengah
+        reasons = []
 
-        # Clamp all inputs to [0, 1]
-        components: Dict[str, float] = {
-            "ml":      max(0.0, min(1.0, ml_prob)),
-            "smc":     max(0.0, min(1.0, smc_signal)),
-            "regime":  max(0.0, min(1.0, regime_score)),
-            "session": max(0.0, min(1.0, session_quality)),
-            "macro":   max(0.0, min(1.0, macro_score)),
-        }
+        # 1. SESSION ANALYSIS (±20 points)
+        session_lower = session.lower()
+        if "overlap" in session_lower or "golden" in session_lower:
+            score += 20
+            reasons.append("[+] Session: London-NY Overlap (terbaik)")
+        elif "london" in session_lower:
+            score += 15
+            reasons.append("[+] Session: London (bagus)")
+        elif "new york" in session_lower or "ny" in session_lower:
+            score += 10
+            reasons.append("[+] Session: New York (bagus)")
+        elif "asia" in session_lower or "tokyo" in session_lower:
+            score += 0
+            reasons.append("[!] Session: Asia (volatilitas rendah)")
+        elif "closed" in session_lower or "weekend" in session_lower:
+            score -= 30
+            reasons.append("[X] Market closed/weekend")
+        else:
+            score += 5
+            reasons.append(f"[i] Session: {session}")
 
-        confidence = sum(self.weights[k] * v for k, v in components.items())
-        confidence = round(max(0.0, min(1.0, confidence)), 4)
+        # 2. REGIME ANALYSIS (±15 points)
+        regime_lower = regime.lower().replace(" ", "_")
+        if regime_lower == "medium_volatility":
+            score += 15
+            reasons.append("[+] Regime: Medium volatility (ideal)")
+        elif regime_lower == "low_volatility":
+            score += 5
+            reasons.append("[!] Regime: Low volatility (hati-hati ranging)")
+        elif regime_lower == "high_volatility":
+            score -= 5
+            reasons.append("[!] Regime: High volatility (lot kecil!)")
+        elif regime_lower == "crisis":
+            score -= 25
+            reasons.append("[X] Regime: Crisis (hindari trading)")
 
-        logger.debug(
-            "Confidence=%.3f [ml=%.2f smc=%.2f regime=%s session=%.2f macro=%.2f]",
-            confidence, ml_prob, smc_signal, regime, session_quality, macro_score,
+        # 3. VOLATILITY ANALYSIS (±10 points)
+        vol_lower = volatility.lower()
+        if vol_lower == "medium":
+            score += 10
+            reasons.append("[+] Volatility: Medium (ideal)")
+        elif vol_lower == "low":
+            score += 0
+            reasons.append("[!] Volatility: Low (pergerakan kecil)")
+        elif vol_lower == "high":
+            score -= 5
+            reasons.append("[!] Volatility: High")
+        elif vol_lower == "extreme":
+            score -= 10
+            reasons.append("[!] Volatility: Extreme (hati-hati)")
+
+        # 4. TREND CLARITY (±10 points)
+        trend_lower = trend_direction.lower()
+        if trend_lower in ["uptrend", "downtrend", "strong_up", "strong_down"]:
+            score += 10
+            reasons.append(f"[+] Trend: {trend_direction} (jelas)")
+        elif trend_lower in ["neutral", "ranging", "sideways"]:
+            score -= 5
+            reasons.append("[!] Trend: Ranging/sideways")
+
+        # 5. SMC CONFLUENCE (±10 points)
+        if has_smc_signal:
+            score += 10
+            reasons.append("[+] SMC: Ada konfirmasi (OB/FVG/BOS)")
+
+        # 6. ML ALIGNMENT (±5 points)
+        if ml_confidence >= 0.70:
+            score += 5
+            reasons.append(f"[+] ML: High confidence ({ml_confidence:.0%})")
+        elif ml_confidence >= 0.60:
+            score += 2
+            reasons.append(f"[i] ML: Moderate confidence ({ml_confidence:.0%})")
+
+        # Clamp score
+        score = max(0, min(100, score))
+
+        # Determine quality and threshold - BALANCED SETTINGS for Active Trading
+        # London/NY session should have reasonable opportunity to trade
+        if score >= 80:
+            quality = MarketQuality.EXCELLENT
+            threshold = self.min_threshold  # 60% - kondisi terbaik
+        elif score >= 65:
+            quality = MarketQuality.GOOD
+            threshold = 0.65  # 65% - kondisi bagus (turun dari 75%)
+        elif score >= 50:
+            quality = MarketQuality.MODERATE
+            threshold = 0.70  # 70% - kondisi biasa (turun dari 80%)
+        elif score >= 35:
+            quality = MarketQuality.POOR
+            threshold = 0.80  # 80% - kondisi kurang bagus (turun dari 85%)
+        else:
+            quality = MarketQuality.AVOID
+            threshold = self.max_threshold  # 85% - hindari trading
+
+        # Track for logging
+        self._last_quality = quality.value
+        self._last_score = score
+        self._last_threshold = threshold
+
+        return MarketAnalysis(
+            quality=quality,
+            confidence_threshold=threshold,
+            reasons=reasons,
+            score=score,
         )
-        return confidence
 
-    def update_thresholds(self, recent_accuracy: float) -> None:
-        """Adapt the confidence threshold based on recent signal accuracy.
-
-        If recent accuracy is below 50 %, the threshold is raised by 5 pp to
-        reduce trade frequency. If accuracy exceeds 65 %, the threshold is
-        relaxed toward the base value.
-
-        Args:
-            recent_accuracy: Win rate fraction from the most recent N trades
-                (0.0–1.0).
-        """
-        if recent_accuracy < 0.50:
-            self._threshold = min(0.85, self._threshold + 0.05)
-            logger.info("Threshold raised to %.2f (accuracy=%.1f%%)", self._threshold, recent_accuracy * 100)
-        elif recent_accuracy > 0.65:
-            self._threshold = max(self.base_threshold, self._threshold - 0.02)
-            logger.info("Threshold relaxed to %.2f (accuracy=%.1f%%)", self._threshold, recent_accuracy * 100)
-
-    def get_trade_confidence(self, signals_dict: Dict[str, Any]) -> float:
-        """Derive a confidence score from a generic signals dictionary.
-
-        Expected keys (all optional, defaulting to neutral values):
-        - ``ml_probability`` (float): ML win probability.
-        - ``smc_strength``   (float): SMC signal strength.
-        - ``regime``         (str):   Market regime label.
-        - ``session_score``  (float): Session quality.
-        - ``macro_score``    (float): Macro/news alignment.
-
-        Args:
-            signals_dict: Mapping of signal names to values.
-
-        Returns:
-            float: Aggregated confidence score.
-        """
-        return self.calculate_confidence(
-            ml_prob=float(signals_dict.get("ml_probability", 0.5)),
-            smc_signal=float(signals_dict.get("smc_strength", 0.5)),
-            regime=str(signals_dict.get("regime", "RANGING")),
-            session_quality=float(signals_dict.get("session_score", 0.5)),
-            macro_score=float(signals_dict.get("macro_score", 0.5)),
-        )
-
-    def is_high_confidence(self, confidence_score: float) -> bool:
-        """Check whether a score meets the current adaptive threshold.
-
-        Args:
-            confidence_score: Score returned by ``calculate_confidence``.
-
-        Returns:
-            bool: True when the score exceeds the current threshold.
-        """
-        return confidence_score >= self._threshold
-
-    def record_outcome(self, score: float, was_correct: bool, timestamp: float = 0.0) -> None:
-        """Store a trade outcome for accuracy tracking.
-
-        Args:
-            score: Confidence score at signal time.
-            was_correct: Whether the subsequent trade was profitable.
-            timestamp: Unix timestamp of the record.
-        """
-        self._history.append(
-            ConfidenceRecord(score=score, was_correct=was_correct, timestamp=timestamp)
-        )
-        accuracy = self.get_recent_accuracy()
-        self.update_thresholds(accuracy)
-
-    def get_recent_accuracy(self, n: int = 20) -> float:
-        """Compute the win rate over the most recent N predictions.
-
-        Args:
-            n: Number of recent records to include.
-
-        Returns:
-            float: Win rate fraction (0.0–1.0). Returns 0.5 when insufficient data.
-        """
-        recent = list(self._history)[-n:]
-        if not recent:
-            return 0.5
-        return sum(1 for r in recent if r.was_correct) / len(recent)
-
-    def get_current_threshold(self) -> float:
-        """Return the current adaptive threshold.
-
-        Returns:
-            float: Current threshold value.
-        """
-        return self._threshold
-
-    def get_component_scores(
+    def get_entry_decision(
         self,
-        ml_prob: float,
-        smc_signal: float,
-        regime: str,
-        session_quality: float,
-        macro_score: float,
-    ) -> Dict[str, float]:
-        """Return individual weighted component contributions for debugging.
-
-        Args:
-            ml_prob: ML win probability.
-            smc_signal: SMC signal strength.
-            regime: Market regime label.
-            session_quality: Session quality score.
-            macro_score: Macro alignment score.
+        ml_confidence: float,
+        analysis: MarketAnalysis,
+    ) -> Tuple[bool, str]:
+        """
+        Tentukan apakah boleh entry berdasarkan analisis.
 
         Returns:
-            Dict[str, float]: Weighted contribution of each component.
+            (can_entry, reason)
         """
-        regime_score = REGIME_SCORES.get(regime, 0.5)
-        raw: Dict[str, float] = {
-            "ml":      ml_prob,
-            "smc":     smc_signal,
-            "regime":  regime_score,
-            "session": session_quality,
-            "macro":   macro_score,
-        }
-        return {k: round(self.weights[k] * v, 4) for k, v in raw.items()}
+        if analysis.quality == MarketQuality.AVOID:
+            return False, f"Market quality: AVOID (score={analysis.score})"
+
+        if ml_confidence >= analysis.confidence_threshold:
+            return True, f"Entry OK: ML {ml_confidence:.0%} >= threshold {analysis.confidence_threshold:.0%} (score={analysis.score})"
+        else:
+            gap = analysis.confidence_threshold - ml_confidence
+            return False, f"Wait: ML {ml_confidence:.0%} < threshold {analysis.confidence_threshold:.0%} (need +{gap:.0%})"
+
+    def get_threshold_summary(self, analysis: MarketAnalysis) -> str:
+        """Get summary string untuk logging."""
+        return (
+            f"Market: {analysis.quality.value.upper()} "
+            f"(score={analysis.score}) -> "
+            f"Threshold: {analysis.confidence_threshold:.0%}"
+        )
+
+
+def create_dynamic_confidence() -> DynamicConfidenceManager:
+    """Create dynamic confidence manager - BALANCED (validated by backtest)."""
+    return DynamicConfidenceManager(
+        base_threshold=0.70,   # Default 70% - reasonable threshold
+        min_threshold=0.60,    # Kondisi terbaik bisa turun ke 60%
+        max_threshold=0.85,    # Kondisi jelek naik ke 85%
+    )
+
+
+if __name__ == "__main__":
+    # Test
+    manager = create_dynamic_confidence()
+
+    print("=== Test 1: Kondisi Ideal ===")
+    analysis = manager.analyze_market(
+        session="London-NY Overlap (GOLDEN)",
+        regime="medium_volatility",
+        volatility="medium",
+        trend_direction="UPTREND",
+        has_smc_signal=True,
+        ml_signal="BUY",
+        ml_confidence=0.68,
+    )
+    print(f"Quality: {analysis.quality.value}")
+    print(f"Score: {analysis.score}")
+    print(f"Threshold: {analysis.confidence_threshold:.0%}")
+    print("Reasons:")
+    for r in analysis.reasons:
+        print(f"  {r}")
+
+    can_entry, reason = manager.get_entry_decision(0.68, analysis)
+    print(f"\nCan Entry (68%): {can_entry} - {reason}")
+
+    print("\n=== Test 2: Kondisi Jelek ===")
+    analysis2 = manager.analyze_market(
+        session="Asia (low liquidity)",
+        regime="low_volatility",
+        volatility="low",
+        trend_direction="RANGING",
+        has_smc_signal=False,
+        ml_signal="BUY",
+        ml_confidence=0.62,
+    )
+    print(f"Quality: {analysis2.quality.value}")
+    print(f"Score: {analysis2.score}")
+    print(f"Threshold: {analysis2.confidence_threshold:.0%}")
+
+    can_entry2, reason2 = manager.get_entry_decision(0.62, analysis2)
+    print(f"\nCan Entry (62%): {can_entry2} - {reason2}")

@@ -1,248 +1,317 @@
-from __future__ import annotations
+"""
+Telegram Command Handlers
+=========================
+Handles all Telegram bot commands separately from main_live.py.
 
-import logging
-from typing import Any, Optional, TYPE_CHECKING
+Commands:
+  /status     — Bot status & account overview
+  /market     — Current market analysis & signals
+  /risk       — Risk management state & settings
+  /positions  — Open positions detail
+  /pos        — Alias for /positions
+  /daily      — Daily trading summary
+  /filters    — Entry filter status
+  /help       — List all available commands
 
-logger = logging.getLogger(__name__)
+Integration:
+    from src.telegram_commands import register_commands
+    register_commands(bot)  # bot = TradingBot instance
+"""
 
-# Command constants
-CMD_STATUS = "/status"
-CMD_POSITIONS = "/positions"
-CMD_BALANCE = "/balance"
-CMD_PERFORMANCE = "/performance"
-CMD_PAUSE = "/pause"
-CMD_RESUME = "/resume"
-CMD_HELP = "/help"
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-_PAUSED = False  # module-level pause flag
+from datetime import datetime, date
+from zoneinfo import ZoneInfo
+from loguru import logger
+
+WIB = ZoneInfo("Asia/Jakarta")
 
 
-class TelegramCommands:
-    """Handler for Telegram bot commands.
+def _fmt_usd(value: float) -> str:
+    """Format USD value with sign."""
+    if value >= 0:
+        return f"+${value:.2f}"
+    return f"-${abs(value):.2f}"
 
-    Each handler receives the relevant application object(s) and returns a
-    formatted string ready to send back to the user via the Telegram API.
 
-    Usage::
+def _timestamp() -> str:
+    """Return formatted WIB timestamp."""
+    return datetime.now(WIB).strftime('%H:%M')
 
-        cmds = TelegramCommands()
-        text = cmds.parse_command("/status")
-        # Route to the appropriate handler with injected dependencies.
+
+def register_commands(bot):
     """
+    Register all Telegram commands on the bot instance.
+
+    Args:
+        bot: TradingBot instance (has .telegram, .mt5, .smart_risk, etc.)
+    """
+    tg = bot.telegram
+    build = tg._build_section
 
     # ------------------------------------------------------------------
-    # Pause / resume state
+    # /status — Bot status & account overview
     # ------------------------------------------------------------------
+    async def cmd_status():
+        balance = bot.mt5.account_balance or 0
+        equity = bot.mt5.account_equity or 0
+        floating = equity - balance
+        session_status = bot.session_filter.get_status_report()
+        risk_rec = bot.smart_risk.get_trading_recommendation()
+        risk_state = bot.smart_risk.get_state()
+        uptime = (datetime.now() - bot._start_time).total_seconds() / 3600
+        avg_ms = (sum(bot._execution_times) / len(bot._execution_times) * 1000) if bot._execution_times else 0
+        wr = (bot._total_session_wins / bot._total_session_trades * 100) if bot._total_session_trades > 0 else 0
+        can_icon = "✅" if session_status.get("can_trade", False) else "⛔"
 
-    @staticmethod
-    def handle_pause() -> str:
-        """Handle /pause command – suspend new trade entries.
+        items_acct = [
+            f"Bal: <code>${balance:,.2f}</code>",
+            f"Eq: <code>${equity:,.2f}</code>",
+            f"Float: <b>{_fmt_usd(floating)}</b>",
+        ]
+        items_session = [
+            f"Trades: <code>{bot._total_session_trades}</code> ({bot._total_session_wins}W) | WR: <code>{wr:.1f}%</code>",
+            f"P/L: <b>{_fmt_usd(bot._total_session_profit)}</b>",
+        ]
+        items_risk = [
+            f"Mode: <code>{risk_rec.get('mode', 'normal').upper()}</code>",
+            f"Daily Loss: <code>${risk_state.daily_loss:.2f}</code> | Streak: <code>{risk_state.consecutive_losses}L</code>",
+            f"Total Loss: <code>${bot.smart_risk._total_loss:.2f}</code>",
+        ]
+        items_bot = [
+            f"{can_icon} {session_status.get('current_session', 'Unknown')} | Vol: <code>{session_status.get('volatility', '?')}</code>",
+            f"Uptime: <code>{uptime:.1f}h</code> | Loops: <code>{bot._loop_count}</code> | Exec: <code>{avg_ms:.0f}ms</code>",
+        ]
 
-        Returns:
-            Confirmation message string.
-        """
-        global _PAUSED
-        _PAUSED = True
-        logger.info("Bot paused via Telegram command")
-        return "⏸️ <b>Bot Paused</b>\nNew trade entries are suspended. Use /resume to restart."
+        return f"""🤖 <b>STATUS</b>
 
-    @staticmethod
-    def handle_resume() -> str:
-        """Handle /resume command – re-enable trade entries.
+{build("Account", items_acct)}
 
-        Returns:
-            Confirmation message string.
-        """
-        global _PAUSED
-        _PAUSED = False
-        logger.info("Bot resumed via Telegram command")
-        return "▶️ <b>Bot Resumed</b>\nTrade entries are now active."
+{build("Session", items_session)}
 
-    @staticmethod
-    def is_paused() -> bool:
-        """Return current pause state.
+{build("Risk", items_risk)}
 
-        Returns:
-            True when the bot is paused.
-        """
-        return _PAUSED
+{build("Bot", items_bot)}
+
+⏰ {_timestamp()} WIB""".strip()
+
+    cmd_status._cmd_desc = "Bot status & account"
 
     # ------------------------------------------------------------------
-    # Status
+    # /market — Current market analysis
     # ------------------------------------------------------------------
+    async def cmd_market():
+        tick = bot.mt5.get_tick(bot.config.symbol)
+        price = tick.bid if tick else 0
+        spread = (tick.ask - tick.bid) if tick else 0
 
-    @staticmethod
-    def handle_status(connector: Any, risk_manager: Any) -> str:
-        """Handle /status command – show bot health and key metrics.
+        session_status = bot.session_filter.get_status_report()
+        h1_bias = getattr(bot, "_h1_bias_cache", "NEUTRAL")
+        regime = getattr(bot, "_last_regime", None)
+        regime_str = regime.value if regime else "unknown"
+        ml_signal = getattr(bot, "_last_ml_signal", "HOLD")
+        ml_conf = getattr(bot, "_last_ml_confidence", 0)
+        smc_signal = getattr(bot, "_last_raw_smc_signal", "")
+        smc_conf = getattr(bot, "_last_raw_smc_confidence", 0)
+        threshold = getattr(bot, "_last_dynamic_threshold", 0.55)
+        quality = getattr(bot, "_last_market_quality", "unknown")
+        score = getattr(bot, "_last_market_score", 0)
 
-        Args:
-            connector: MT5 / broker connector object with account info methods.
-            risk_manager: Risk manager with daily loss and drawdown metrics.
-
-        Returns:
-            Formatted HTML status string.
-        """
         try:
-            balance = getattr(connector, "get_balance", lambda: "N/A")()
-            equity = getattr(connector, "get_equity", lambda: "N/A")()
-            daily_loss = getattr(risk_manager, "get_daily_loss_pct", lambda: 0.0)()
-            status_icon = "⏸️" if _PAUSED else "🟢"
-            mode = "PAUSED" if _PAUSED else "ACTIVE"
+            df = bot.mt5.get_market_data(bot.config.symbol, bot.config.execution_timeframe, 50)
+            atr = df["atr"].tail(1).item() if "atr" in df.columns else 0
+        except Exception:
+            atr = 0
 
-            return (
-                f"{status_icon} <b>GOLDAI Status</b>\n"
-                f"━━━━━━━━━━━━━━━\n"
-                f"Mode: <b>{mode}</b>\n"
-                f"Balance: <b>${balance:,.2f}</b>\n"
-                f"Equity: <b>${equity:,.2f}</b>\n"
-                f"Daily Loss: <b>{daily_loss:.2%}</b>\n"
-            )
-        except Exception as exc:
-            logger.error("handle_status error: %s", exc)
-            return f"⚠️ Status unavailable: {exc}"
+        sig_emoji = {"BUY": "🟢", "SELL": "🔴"}.get(ml_signal, "⚪")
+        can_icon = "✅ READY" if session_status.get("can_trade", False) else "⛔ WAIT"
 
-    # ------------------------------------------------------------------
-    # Positions
-    # ------------------------------------------------------------------
+        items_price = [
+            f"<b>{bot.config.symbol}</b> <code>${price:.2f}</code>",
+            f"ATR: <code>{atr:.2f}</code> | Spread: <code>{spread:.1f}</code>",
+        ]
+        items_signal = [
+            f"{sig_emoji} ML: <code>{ml_signal}</code> {ml_conf:.0%} / thresh {threshold:.0%}",
+            f"SMC: <code>{smc_signal or 'NONE'}</code> ({smc_conf:.0%})",
+            f"Quality: <code>{quality.upper()}</code> (score:{score})",
+            f"H1 Bias: <code>{h1_bias}</code>",
+        ]
+        items_market = [
+            f"Regime: <code>{regime_str}</code> | Vol: <code>{session_status.get('volatility', '?')}</code>",
+            f"Session: <code>{session_status.get('current_session', 'Unknown')}</code>",
+            f"Status: {can_icon}",
+        ]
 
-    @staticmethod
-    def handle_positions(connector: Any) -> str:
-        """Handle /positions command – list open positions.
+        return f"""📊 <b>MARKET</b>
 
-        Args:
-            connector: Broker connector with get_open_positions() method.
+{build("Price", items_price)}
 
-        Returns:
-            Formatted HTML positions list.
-        """
-        try:
-            positions = getattr(connector, "get_open_positions", lambda: [])()
-            if not positions:
-                return "📋 <b>Open Positions</b>\n━━━━━━━━━━━━━━━\nNo open positions."
+{build("AI Signal", items_signal)}
 
-            lines = ["📋 <b>Open Positions</b>", "━━━━━━━━━━━━━━━"]
-            for pos in positions:
-                direction = "🟢 LONG" if getattr(pos, "type", 0) == 0 else "🔴 SHORT"
-                symbol = getattr(pos, "symbol", "XAUUSD")
-                lots = getattr(pos, "volume", 0.0)
-                profit = getattr(pos, "profit", 0.0)
-                profit_icon = "📈" if profit >= 0 else "📉"
-                lines.append(
-                    f"{direction} {symbol} | {lots:.2f} lots | "
-                    f"{profit_icon} ${profit:.2f}"
-                )
-            return "\n".join(lines)
-        except Exception as exc:
-            logger.error("handle_positions error: %s", exc)
-            return f"⚠️ Positions unavailable: {exc}"
+{build("Market", items_market)}
+
+⏰ {_timestamp()} WIB""".strip()
+
+    cmd_market._cmd_desc = "Market analysis & signals"
 
     # ------------------------------------------------------------------
-    # Balance
+    # /risk — Risk management state
     # ------------------------------------------------------------------
+    async def cmd_risk():
+        risk_state = bot.smart_risk.get_state()
+        risk_rec = bot.smart_risk.get_trading_recommendation()
+        balance = bot.mt5.account_balance or bot.config.capital
+        max_daily_usd = bot.smart_risk.max_daily_loss_usd
+        max_total_usd = balance * bot.smart_risk.max_total_loss_percent / 100
 
-    @staticmethod
-    def handle_balance(connector: Any) -> str:
-        """Handle /balance command – show account balance details.
+        items_settings = [
+            f"Risk/Trade: <code>{bot.config.risk.risk_per_trade}%</code>",
+            f"Max Daily Loss: <code>{bot.config.risk.max_daily_loss}%</code> (${max_daily_usd:.2f})",
+            f"Max Total Loss: <code>{bot.smart_risk.max_total_loss_percent}%</code> (${max_total_usd:.2f})",
+            f"Max Lot: <code>{bot.smart_risk.max_lot_size}</code>",
+            f"Max Positions: <code>{bot.smart_risk.max_concurrent_positions}</code>",
+        ]
+        items_state = [
+            f"Mode: <code>{risk_rec.get('mode', 'normal').upper()}</code>",
+            f"Daily Loss: <code>${risk_state.daily_loss:.2f}</code> / <code>${max_daily_usd:.2f}</code>",
+            f"Daily Profit: <code>${risk_state.daily_profit:.2f}</code>",
+            f"Total Loss: <code>${bot.smart_risk._total_loss:.2f}</code>",
+            f"Streak: <code>{risk_state.consecutive_losses}L</code>",
+        ]
+        items_rec = [
+            f"Lot: <code>{risk_rec.get('recommended_lot', 0)}</code>",
+            f"Reason: <code>{risk_rec.get('reason', '')[:60]}</code>",
+        ]
 
-        Args:
-            connector: Broker connector with account info methods.
+        return f"""🛡 <b>RISK</b>
 
-        Returns:
-            Formatted HTML balance string.
-        """
-        try:
-            balance = getattr(connector, "get_balance", lambda: 0.0)()
-            equity = getattr(connector, "get_equity", lambda: 0.0)()
-            margin = getattr(connector, "get_margin", lambda: 0.0)()
-            free_margin = getattr(connector, "get_free_margin", lambda: 0.0)()
+{build("Settings", items_settings)}
 
-            return (
-                "💰 <b>Account Balance</b>\n"
-                "━━━━━━━━━━━━━━━\n"
-                f"Balance:     <b>${balance:,.2f}</b>\n"
-                f"Equity:      <b>${equity:,.2f}</b>\n"
-                f"Margin:      <b>${margin:,.2f}</b>\n"
-                f"Free Margin: <b>${free_margin:,.2f}</b>\n"
-            )
-        except Exception as exc:
-            logger.error("handle_balance error: %s", exc)
-            return f"⚠️ Balance unavailable: {exc}"
+{build("Current State", items_state)}
 
-    # ------------------------------------------------------------------
-    # Performance
-    # ------------------------------------------------------------------
+{build("Recommendation", items_rec)}
 
-    @staticmethod
-    def handle_performance(trade_logger: Any) -> str:
-        """Handle /performance command – show trading performance summary.
+⏰ {_timestamp()} WIB""".strip()
 
-        Args:
-            trade_logger: Trade logger / analytics object with summary methods.
-
-        Returns:
-            Formatted HTML performance string.
-        """
-        try:
-            summary = getattr(trade_logger, "get_summary", lambda: {})()
-            wins = summary.get("wins", 0)
-            losses = summary.get("losses", 0)
-            total = wins + losses
-            win_rate = wins / total if total else 0.0
-            net_pnl = summary.get("net_pnl", 0.0)
-            pnl_icon = "📈" if net_pnl >= 0 else "📉"
-
-            return (
-                f"📊 <b>Performance Summary</b>\n"
-                "━━━━━━━━━━━━━━━\n"
-                f"Total Trades: <b>{total}</b>\n"
-                f"Wins: <b>{wins}</b> | Losses: <b>{losses}</b>\n"
-                f"Win Rate: <b>{win_rate:.1%}</b>\n"
-                f"Net P&L: {pnl_icon} <b>${net_pnl:,.2f}</b>\n"
-            )
-        except Exception as exc:
-            logger.error("handle_performance error: %s", exc)
-            return f"⚠️ Performance data unavailable: {exc}"
+    cmd_risk._cmd_desc = "Risk management state"
 
     # ------------------------------------------------------------------
-    # Command parser
+    # /positions — Open positions detail
     # ------------------------------------------------------------------
-
-    @staticmethod
-    def parse_command(text: str) -> Optional[str]:
-        """Extract the command keyword from a Telegram message.
-
-        Args:
-            text: Raw message text from the Telegram update.
-
-        Returns:
-            The command string (e.g. '/status') or None if not a command.
-        """
-        if not text or not text.startswith("/"):
-            return None
-        # Strip @botname suffix if present and extract first word
-        parts = text.strip().split()
-        cmd = parts[0].split("@")[0].lower()
-        known = {
-            CMD_STATUS, CMD_POSITIONS, CMD_BALANCE,
-            CMD_PERFORMANCE, CMD_PAUSE, CMD_RESUME, CMD_HELP,
-        }
-        return cmd if cmd in known else None
-
-    @staticmethod
-    def handle_help() -> str:
-        """Return the help text listing all commands.
-
-        Returns:
-            Formatted HTML help string.
-        """
-        return (
-            "🤖 <b>GOLDAI Commands</b>\n"
-            "━━━━━━━━━━━━━━━\n"
-            "/status      – Bot health and key metrics\n"
-            "/positions   – Open positions list\n"
-            "/balance     – Account balance details\n"
-            "/performance – Trading performance summary\n"
-            "/pause       – Suspend new entries\n"
-            "/resume      – Re-enable entries\n"
-            "/help        – This message\n"
+    async def cmd_positions():
+        positions = bot.mt5.get_open_positions(
+            symbol=bot.config.symbol,
+            magic=bot.config.magic_number,
         )
+        if positions is None or len(positions) == 0:
+            return f"📭 <b>POSITIONS</b>\n\n└ No open positions\n\n⏰ {_timestamp()} WIB"
+
+        pos_items = []
+        total_profit = 0
+        for row in positions.iter_rows(named=True):
+            ticket = row.get("ticket", 0)
+            direction = "BUY" if row.get("type", 0) == 0 else "SELL"
+            profit = row.get("profit", 0)
+            total_profit += profit
+            open_price = row.get("price_open", 0)
+            current = row.get("price_current", 0)
+            sl = row.get("sl", 0)
+            tp = row.get("tp", 0)
+            lot = row.get("volume", 0)
+
+            guard = bot.smart_risk._position_guards.get(ticket)
+            momentum = guard.momentum_score if guard else 0
+
+            pos_items.append(f"#{ticket} {direction} <code>{lot}</code>")
+            pos_items.append(f"  Open: <code>{open_price:.2f}</code> -> Now: <code>{current:.2f}</code>")
+            pos_items.append(f"  SL: <code>{sl:.2f}</code> | TP: <code>{tp:.2f}</code>")
+            pos_items.append(f"  P/L: <b>{_fmt_usd(profit)}</b> | M: <code>{momentum:+.0f}</code>")
+
+        summary = [f"Total: <code>{len(positions)}</code> positions, <b>{_fmt_usd(total_profit)}</b>"]
+
+        return f"""📈 <b>POSITIONS</b>
+
+{build("Open", pos_items)}
+
+{build("Summary", summary)}
+
+⏰ {_timestamp()} WIB""".strip()
+
+    cmd_positions._cmd_desc = "Open positions detail"
+
+    # ------------------------------------------------------------------
+    # /daily — Daily trading summary
+    # ------------------------------------------------------------------
+    async def cmd_daily():
+        balance = bot.mt5.account_balance or bot.config.capital
+        trades = bot._total_session_trades
+        wins = bot._total_session_wins
+        losses = trades - wins
+        wr = (wins / trades * 100) if trades > 0 else 0
+        day_change = ((balance - bot._daily_start_balance) / bot._daily_start_balance * 100) if bot._daily_start_balance > 0 else 0
+        day_str = f"+{day_change:.2f}%" if day_change >= 0 else f"{day_change:.2f}%"
+
+        items_balance = [
+            f"Start: <code>${bot._daily_start_balance:,.2f}</code>",
+            f"Now: <code>${balance:,.2f}</code> (<b>{day_str}</b>)",
+            f"P/L: <b>{_fmt_usd(bot._total_session_profit)}</b>",
+        ]
+        items_stats = [
+            f"Trades: <code>{trades}</code>",
+            f"Wins: <code>{wins}</code> | Losses: <code>{losses}</code>",
+            f"Win Rate: <code>{wr:.1f}%</code>",
+        ]
+
+        return f"""📋 <b>DAILY</b> {date.today().strftime('%Y-%m-%d')}
+
+{build("Balance", items_balance)}
+
+{build("Stats", items_stats)}
+
+⏰ {_timestamp()} WIB""".strip()
+
+    cmd_daily._cmd_desc = "Daily trading summary"
+
+    # ------------------------------------------------------------------
+    # /filters — Entry filter status
+    # ------------------------------------------------------------------
+    async def cmd_filters():
+        filters = getattr(bot, "_last_filter_results", [])
+        if not filters:
+            return f"🔍 <b>FILTERS</b>\n\n└ No filter data yet (wait for next candle)\n\n⏰ {_timestamp()} WIB"
+
+        filter_items = []
+        for f in filters:
+            icon = "✅" if f.get("passed", True) else "❌"
+            filter_items.append(f"{icon} {f.get('name', '')}: <code>{f.get('detail', '')}</code>")
+
+        passed = sum(1 for f in filters if f.get("passed", True))
+        total = len(filters)
+
+        return f"""🔍 <b>FILTERS</b> ({passed}/{total} passed)
+
+{build("Entry Filters", filter_items)}
+
+⏰ {_timestamp()} WIB""".strip()
+
+    cmd_filters._cmd_desc = "Entry filter status"
+
+    # ------------------------------------------------------------------
+    # Register all commands
+    # ------------------------------------------------------------------
+    tg.register_command("status", cmd_status)
+    tg.register_command("s", cmd_status)          # alias
+    tg.register_command("market", cmd_market)
+    tg.register_command("m", cmd_market)           # alias
+    tg.register_command("risk", cmd_risk)
+    tg.register_command("positions", cmd_positions)
+    tg.register_command("pos", cmd_positions)      # alias
+    tg.register_command("p", cmd_positions)        # alias
+    tg.register_command("daily", cmd_daily)
+    tg.register_command("d", cmd_daily)            # alias
+    tg.register_command("filters", cmd_filters)
+    tg.register_command("f", cmd_filters)          # alias
+
+    logger.info("Telegram commands registered: /status /market /risk /positions /daily /filters /help")

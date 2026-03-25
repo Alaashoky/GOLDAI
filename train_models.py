@@ -1,232 +1,276 @@
-"""GOLDAI - Model Training Script.
-
-Fetches historical XAUUSD data from MetaTrader 5, runs the full feature
-engineering pipeline, creates labelled training data, and trains an
-XGBoost model which is then saved to the models/ directory.
 """
-from __future__ import annotations
+Model Training Script
+=====================
+Fetches historical data from MT5 and trains all models.
 
-import argparse
-import logging
+Usage:
+    python train_models.py
+
+Output:
+    - models/xgboost_model.pkl
+    - models/hmm_regime.pkl
+"""
+
+import os
 import sys
 from pathlib import Path
+from datetime import datetime
+import polars as pl
+import numpy as np
+from loguru import logger
 
-logger = logging.getLogger(__name__)
+# Configure logging
+logger.remove()
+logger.add(
+    sys.stdout,
+    format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{message}</cyan>",
+    level="INFO",
+)
+logger.add(
+    "logs/training_{time:YYYY-MM-DD}.log",
+    format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {message}",
+    rotation="1 day",
+    level="DEBUG",
+)
 
-# ---------------------------------------------------------------------------
-# Optional imports
-# ---------------------------------------------------------------------------
-try:
-    from src.config import get_settings
-    from src.mt5_connector import MT5Connector
-    from src.feature_eng import compute_features, create_labels
-    from src.ml_model import TradingModel
-    IMPORTS_OK = True
-except ImportError as _ie:
-    logger.warning("Import error: %s", _ie)
-    IMPORTS_OK = False
+# Create directories
+os.makedirs("logs", exist_ok=True)
+os.makedirs("models", exist_ok=True)
+os.makedirs("data", exist_ok=True)
 
-try:
-    import polars as pl
-    POLARS_OK = True
-except ImportError:
-    POLARS_OK = False
-
-
-def _setup_logging() -> None:
-    """Configure basic console logging."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-        handlers=[logging.StreamHandler(sys.stdout)],
-    )
+# Import modules
+from src.config import TradingConfig, get_config
+from src.mt5_connector import MT5Connector
+from src.smc_polars import SMCAnalyzer
+from src.feature_eng import FeatureEngineer
+from src.regime_detector import MarketRegimeDetector
+from src.ml_model import TradingModel, get_default_feature_columns
 
 
-def fetch_data(connector: "MT5Connector", symbol: str, bars: int) -> "pl.DataFrame | None":
-    """Fetch H1 OHLCV data from MT5.
-
-    Args:
-        connector: Active MT5Connector instance.
-        symbol: Trading symbol, e.g. "XAUUSD".
-        bars: Number of historical bars to fetch.
-
-    Returns:
-        Polars DataFrame of OHLCV data or None if fetch failed.
-    """
-    logger.info("Fetching %d H1 bars for %s …", bars, symbol)
-    df = connector.get_ohlcv(symbol, "H1", count=bars)
-    if df is None or df.is_empty():
-        logger.error("No data returned for %s.", symbol)
-        return None
-    logger.info("Fetched %d rows.", len(df))
+def fetch_training_data(
+    connector: MT5Connector,
+    symbol: str,
+    timeframe: str,
+    bars: int = 5000,
+) -> pl.DataFrame:
+    """Fetch historical data for training."""
+    logger.info(f"Fetching {bars} bars of {symbol} {timeframe} data...")
+    
+    df = connector.get_market_data(symbol, timeframe, bars)
+    
+    if len(df) == 0:
+        raise ValueError("No data received from MT5")
+    
+    logger.info(f"Received {len(df)} bars")
+    logger.info(f"Date range: {df['time'].min()} to {df['time'].max()}")
+    
     return df
 
 
-def prepare_dataset(df: "pl.DataFrame", forward_bars: int = 5, move_threshold: float = 0.002) -> "tuple[object, object] | None":
-    """Run feature engineering and label generation.
-
-    Args:
-        df: Raw OHLCV DataFrame.
-        forward_bars: Number of future bars for label look-ahead.
-        move_threshold: Minimum price move fraction to assign BUY/SELL label.
-
-    Returns:
-        Tuple of (X numpy array, y numpy array) or None on failure.
-    """
-    import numpy as np
-
-    logger.info("Computing features …")
-    features_df = compute_features(df)
-    if features_df is None or features_df.is_empty():
-        logger.error("Feature computation returned empty DataFrame.")
-        return None
-
-    logger.info("Creating labels (forward_bars=%d, threshold=%.4f) …", forward_bars, move_threshold)
-    labels = create_labels(df, forward_bars=forward_bars, threshold=move_threshold)
-    if labels is None or len(labels) == 0:
-        logger.error("Label creation returned empty series.")
-        return None
-
-    exclude = {"time", "open", "high", "low", "close", "tick_volume"}
-    feature_cols = [c for c in features_df.columns if c not in exclude]
-    if not feature_cols:
-        logger.error("No feature columns found.")
-        return None
-
-    X = features_df[feature_cols].to_numpy()
-    y = labels.to_numpy() if hasattr(labels, "to_numpy") else labels
-
-    # Align lengths (labels may have fewer rows due to look-ahead)
-    min_len = min(len(X), len(y))
-    X = X[:min_len]
-    y = y[:min_len]
-
-    # Remove rows with NaN
-    mask = ~(np.isnan(X).any(axis=1) | np.isnan(y.astype(float)))
-    X, y = X[mask], y[mask]
-
-    logger.info("Dataset: %d samples, %d features.", len(X), X.shape[1])
-    return X, y
+def prepare_features(df: pl.DataFrame) -> pl.DataFrame:
+    """Apply all feature engineering."""
+    logger.info("Applying feature engineering...")
+    
+    # Technical indicators
+    fe = FeatureEngineer()
+    df = fe.calculate_all(df, include_ml_features=True)
+    
+    # SMC indicators
+    smc = SMCAnalyzer(swing_length=5)
+    df = smc.calculate_all(df)
+    
+    # Create target variable
+    df = fe.create_target(df, lookahead=1)
+    
+    logger.info(f"Total features created: {len(df.columns)}")
+    
+    return df
 
 
-def train(X: object, y: object, model_path: str) -> "TradingModel":
-    """Train XGBoost model and return the trained instance.
+def train_hmm_model(
+    df: pl.DataFrame,
+    model_path: str = "models/hmm_regime.pkl",
+) -> MarketRegimeDetector:
+    """Train HMM regime detection model."""
+    logger.info("=" * 60)
+    logger.info("Training HMM Regime Model")
+    logger.info("=" * 60)
+    
+    detector = MarketRegimeDetector(
+        n_regimes=3,
+        lookback_periods=500,
+        model_path=model_path,
+    )
+    
+    detector.fit(df)
+    
+    if detector.fitted:
+        # Add regime predictions to df
+        df_with_regime = detector.predict(df)
+        
+        # Show regime distribution
+        regime_counts = df_with_regime.group_by("regime_name").len()
+        logger.info("Regime Distribution:")
+        for row in regime_counts.iter_rows(named=True):
+            if row["regime_name"]:
+                logger.info(f"  {row['regime_name']}: {row['len']} bars")
+        
+        # Show transition matrix
+        logger.info("Transition Matrix:")
+        transmat = detector.get_transition_matrix()
+        for i, regime in detector.regime_mapping.items():
+            probs = [f"{p:.2f}" for p in transmat[i]]
+            logger.info(f"  {regime.value}: {probs}")
+    
+    return detector
 
-    Args:
-        X: Feature matrix (numpy array).
-        y: Label vector (numpy array).
-        model_path: Where to save the serialised model.
 
-    Returns:
-        Trained TradingModel instance.
-    """
-    from sklearn.model_selection import train_test_split
+def train_xgboost_model(
+    df: pl.DataFrame,
+    model_path: str = "models/xgboost_model.pkl",
+) -> TradingModel:
+    """Train XGBoost prediction model with anti-overfitting measures."""
+    logger.info("=" * 60)
+    logger.info("Training XGBoost Model (Anti-Overfit Config)")
+    logger.info("=" * 60)
 
-    logger.info("Splitting data into train/test (80/20) …")
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
+    # Get feature columns that exist in df
+    default_features = get_default_feature_columns()
+    available_features = [f for f in default_features if f in df.columns]
 
-    model = TradingModel(model_path=model_path)
-    logger.info("Training XGBoost model …")
-    model.fit(X_train, y_train)
+    logger.info(f"Available features: {len(available_features)}/{len(default_features)}")
 
-    logger.info("Evaluating on test set …")
-    metrics = model.evaluate(X_test, y_test)
+    # Create model with anti-overfitting parameters
+    model = TradingModel(
+        confidence_threshold=0.60,  # Lowered from 0.65 for more signals
+        model_path=model_path,
+    )
 
-    print("\n" + "=" * 60)
-    print("MODEL PERFORMANCE")
-    print("=" * 60)
-    print(f"Accuracy  : {metrics.accuracy:.4f}")
-    print(f"Precision : {metrics.precision:.4f}")
-    print(f"Recall    : {metrics.recall:.4f}")
-    print(f"F1 Score  : {metrics.f1:.4f}")
-    print("-" * 60)
-    print(metrics.report)
-
-    # Feature importance
-    importance = model.get_feature_importance()
-    if importance:
-        print("Top 10 Feature Importances:")
-        sorted_imp = sorted(importance.items(), key=lambda kv: kv[1], reverse=True)[:10]
-        for feat, score in sorted_imp:
-            print(f"  {feat:<30s}: {score:.4f}")
-
+    # Train with stricter settings
+    model.fit(
+        df,
+        available_features,
+        target_col="target",
+        train_ratio=0.7,           # More test data (30% instead of 20%)
+        num_boost_round=50,        # Fewer rounds (was 100)
+        early_stopping_rounds=5,   # Earlier stopping (was 10)
+    )
+    
+    if model.fitted:
+        # Show feature importance
+        logger.info("Top 10 Feature Importance:")
+        for feat, imp in model.get_feature_importance(10).items():
+            logger.info(f"  {feat}: {imp:.4f}")
+        
+        # Walk-forward validation
+        logger.info("Running walk-forward validation...")
+        results = model.walk_forward_train(
+            df,
+            available_features,
+            "target",
+            train_window=500,
+            test_window=50,
+            step=50,
+        )
+        
+        if results:
+            avg_train = np.mean([r[0] for r in results])
+            avg_test = np.mean([r[1] for r in results])
+            logger.info(f"Walk-forward Results:")
+            logger.info(f"  Avg Train AUC: {avg_train:.4f}")
+            logger.info(f"  Avg Test AUC: {avg_test:.4f}")
+            logger.info(f"  Overfitting ratio: {avg_train/avg_test:.2f}")
+    
     return model
 
 
-def save_model(model: "TradingModel", output_path: str) -> None:
-    """Persist the trained model to disk.
-
-    Args:
-        model: Trained TradingModel instance.
-        output_path: Destination file path.
-    """
-    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    model.save(output_path)
-    logger.info("Model saved to %s", output_path)
+def save_training_data(df: pl.DataFrame, path: str = "data/training_data.parquet"):
+    """Save training data for future reference."""
+    df.write_parquet(path)
+    logger.info(f"Training data saved to {path}")
 
 
-def parse_args() -> argparse.Namespace:
-    """Parse command-line arguments.
-
-    Returns:
-        Parsed Namespace object.
-    """
-    parser = argparse.ArgumentParser(
-        description="Train the GOLDAI XGBoost trading model.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    parser.add_argument("--bars", type=int, default=5000, help="Number of H1 bars to fetch.")
-    parser.add_argument("--symbol", type=str, default="XAUUSD", help="Trading symbol.")
-    parser.add_argument("--output", type=str, default="models/xgb_model.pkl", help="Output model path.")
-    parser.add_argument("--forward-bars", type=int, default=5, help="Look-ahead bars for label creation.")
-    parser.add_argument("--threshold", type=float, default=0.002, help="Price-move threshold for BUY/SELL label.")
-    return parser.parse_args()
-
-
-def main() -> None:
-    """Main entry point for model training."""
-    _setup_logging()
-
-    if not IMPORTS_OK or not POLARS_OK:
-        logger.error("Required modules not available. Install dependencies first.")
-        sys.exit(1)
-
-    args = parse_args()
-    settings = get_settings()
-
-    # Override symbol from args if provided explicitly
-    symbol = args.symbol or settings.symbol
-    output = args.output or settings.model_path
-
+def main():
+    """Main training pipeline."""
+    logger.info("=" * 60)
+    logger.info("SMART TRADING BOT - MODEL TRAINING")
+    logger.info("=" * 60)
+    
+    # Load config
+    config = get_config()
+    logger.info(f"Symbol: {config.symbol}")
+    logger.info(f"Capital: ${config.capital:,.2f}")
+    logger.info(f"Mode: {config.capital_mode.value}")
+    
+    # Connect to MT5
+    logger.info("Connecting to MT5...")
     connector = MT5Connector(
-        login=settings.mt5_login,
-        password=settings.mt5_password,
-        server=settings.mt5_server,
-        path=settings.mt5_path,
+        login=config.mt5_login,
+        password=config.mt5_password,
+        server=config.mt5_server,
+        path=config.mt5_path,
     )
-
-    logger.info("Connecting to MetaTrader 5 …")
-    if not connector.connect():
-        logger.error("MT5 connection failed.")
-        sys.exit(1)
-
+    
     try:
-        df = fetch_data(connector, symbol, args.bars)
-        if df is None:
-            sys.exit(1)
-
-        result = prepare_dataset(df, forward_bars=args.forward_bars, move_threshold=args.threshold)
-        if result is None:
-            sys.exit(1)
-
-        X, y = result
-        model = train(X, y, output)
-        save_model(model, output)
-        print(f"\n✅ Training complete — model saved to {output}")
-
+        connector.connect()
+        logger.info("MT5 connected successfully!")
+        
+        # Get account info
+        balance = connector.account_balance
+        equity = connector.account_equity
+        logger.info(f"Account Balance: ${balance:,.2f}")
+        logger.info(f"Account Equity: ${equity:,.2f}")
+        
+    except Exception as e:
+        logger.error(f"MT5 connection failed: {e}")
+        logger.info("Please ensure:")
+        logger.info("  1. MT5 terminal is running")
+        logger.info("  2. Auto-trading is enabled")
+        logger.info("  3. Login credentials are correct")
+        return
+    
+    try:
+        # Fetch data - MORE DATA for better generalization
+        df = fetch_training_data(
+            connector,
+            config.symbol,
+            config.execution_timeframe,
+            bars=15000,  # Increased for better HMM regime separation
+        )
+        
+        # Prepare features
+        df = prepare_features(df)
+        
+        # Save raw data
+        save_training_data(df)
+        
+        # Train HMM
+        hmm_model = train_hmm_model(df)
+        
+        # Add regime to features
+        if hmm_model.fitted:
+            df = hmm_model.predict(df)
+        
+        # Train XGBoost
+        xgb_model = train_xgboost_model(df)
+        
+        # Summary
+        logger.info("=" * 60)
+        logger.info("TRAINING COMPLETE")
+        logger.info("=" * 60)
+        logger.info(f"HMM Model: {'SAVED' if hmm_model.fitted else 'FAILED'}")
+        logger.info(f"XGBoost Model: {'SAVED' if xgb_model.fitted else 'FAILED'}")
+        logger.info(f"Models saved in: models/")
+        logger.info(f"Training data saved in: data/")
+        
+    except Exception as e:
+        logger.error(f"Training failed: {e}")
+        import traceback
+        traceback.print_exc()
+    
     finally:
         connector.disconnect()
+        logger.info("MT5 disconnected")
 
 
 if __name__ == "__main__":

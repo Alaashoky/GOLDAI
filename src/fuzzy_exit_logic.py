@@ -1,346 +1,400 @@
-from __future__ import annotations
+"""
+Fuzzy Logic Controller for Exit Confidence Aggregation
+=======================================================
+Combines multiple weak exit signals into a single confidence score (0.0-1.0).
 
-import logging
-from dataclasses import dataclass, field
+Current problem: 8 isolated exit checks return True/False, missing weak correlations.
+Fuzzy solution: Aggregate velocity, acceleration, profit_retention, RSI, time, etc.
+into probabilistic exit decision.
 
-logger = logging.getLogger(__name__)
+Input variables (6):
+- velocity: $/second (-0.5 to +0.5)
+- acceleration: $/s² (-0.01 to +0.01)
+- profit_retention: current_profit / peak_profit (0.0-1.2)
+- rsi: RSI indicator (0-100)
+- time_in_trade: Minutes since entry (0-60+)
+- profit_level: profit / tp_target (0.0-2.0)
+
+Output:
+- exit_confidence: 0.0-1.0 (exit if > 0.70, warning if > 0.50)
+
+Rule base: 30+ fuzzy rules derived from v6 exit logic.
+
+Author: AI Assistant (Phase 3 - Advanced Exit Strategies)
+"""
+
+import numpy as np
+from typing import Optional
+
+try:
+    import skfuzzy as fuzz
+    from skfuzzy import control as ctrl
+    _SKFUZZY_AVAILABLE = True
+except ImportError:
+    _SKFUZZY_AVAILABLE = False
 
 
-@dataclass
-class FuzzyExitScore:
-    """Result of fuzzy exit logic evaluation.
+class FuzzyExitController:
+    """
+    Fuzzy logic system for exit confidence calculation.
 
-    Attributes:
-        score: Exit score in range [0.0, 1.0].
-        should_exit: Whether exit is recommended.
-        reason: Human-readable explanation.
+    Aggregates 6 input variables into exit confidence score.
     """
 
-    score: float
-    should_exit: bool
-    reason: str
+    def __init__(self):
+        """Initialize fuzzy control system with rules."""
+        if not _SKFUZZY_AVAILABLE:
+            raise ImportError(
+                "scikit-fuzzy not installed. Install with: pip install scikit-fuzzy"
+            )
 
+        # === INPUT VARIABLES ===
+        self.velocity = ctrl.Antecedent(np.linspace(-0.5, 0.5, 101), 'velocity')
+        self.acceleration = ctrl.Antecedent(np.linspace(-0.01, 0.01, 101), 'accel')
+        self.profit_retention = ctrl.Antecedent(np.linspace(0, 1.2, 121), 'retention')
+        self.rsi = ctrl.Antecedent(np.linspace(0, 100, 101), 'rsi')
+        self.time_in_trade = ctrl.Antecedent(np.linspace(0, 60, 61), 'time')
+        self.profit_level = ctrl.Antecedent(np.linspace(0, 2.0, 101), 'profit_lvl')
 
-class FuzzyExitLogic:
-    """Fuzzy logic system for trade exit decisions.
+        # === OUTPUT VARIABLE ===
+        self.exit_confidence = ctrl.Consequent(np.linspace(0, 1, 101), 'exit_conf')
 
-    Uses triangular and trapezoidal membership functions to evaluate
-    multiple inputs and produce a defuzzified exit score via the
-    centroid method.
-    """
+        # === MEMBERSHIP FUNCTIONS ===
+        self._define_membership_functions()
 
-    def __init__(self, exit_threshold: float = 0.55) -> None:
-        """Initialize with configurable exit threshold.
+        # === FUZZY RULES ===
+        self.rules = self._create_rule_base()
 
-        Args:
-            exit_threshold: Score above which we recommend exit (default 0.55).
-        """
-        self.exit_threshold = exit_threshold
+        # Create control system
+        self.exit_ctrl = ctrl.ControlSystem(self.rules)
+        self.simulation = ctrl.ControlSystemSimulation(self.exit_ctrl)
 
-    # ------------------------------------------------------------------
-    # Membership functions
-    # ------------------------------------------------------------------
+    def _define_membership_functions(self):
+        """Define membership functions for all variables."""
 
-    def _trimf(self, x: float, a: float, b: float, c: float) -> float:
-        """Triangular membership function.
+        # VELOCITY ($/second)
+        self.velocity['crashing'] = fuzz.trapmf(self.velocity.universe, [-0.5, -0.5, -0.15, -0.08])
+        self.velocity['declining'] = fuzz.trimf(self.velocity.universe, [-0.15, -0.05, 0])
+        self.velocity['stalling'] = fuzz.trimf(self.velocity.universe, [-0.03, 0, 0.03])
+        self.velocity['growing'] = fuzz.trimf(self.velocity.universe, [0, 0.05, 0.15])
+        self.velocity['accelerating'] = fuzz.trapmf(self.velocity.universe, [0.08, 0.15, 0.5, 0.5])
 
-        Args:
-            x: Input value.
-            a: Left foot.
-            b: Peak.
-            c: Right foot.
+        # ACCELERATION ($/s²)
+        self.acceleration['strong_negative'] = fuzz.trapmf(self.acceleration.universe, [-0.01, -0.01, -0.005, -0.002])
+        self.acceleration['negative'] = fuzz.trimf(self.acceleration.universe, [-0.005, -0.001, 0])
+        self.acceleration['neutral'] = fuzz.trimf(self.acceleration.universe, [-0.001, 0, 0.001])
+        self.acceleration['positive'] = fuzz.trimf(self.acceleration.universe, [0, 0.001, 0.005])
+        self.acceleration['strong_positive'] = fuzz.trapmf(self.acceleration.universe, [0.002, 0.005, 0.01, 0.01])
 
-        Returns:
-            Membership degree in [0, 1].
-        """
-        if x <= a or x >= c:
-            return 0.0
-        if x <= b:
-            return (x - a) / (b - a) if b != a else 1.0
-        return (c - x) / (c - b) if c != b else 1.0
+        # PROFIT RETENTION (current / peak)
+        self.profit_retention['collapsed'] = fuzz.trapmf(self.profit_retention.universe, [0, 0, 0.3, 0.5])
+        self.profit_retention['low'] = fuzz.trimf(self.profit_retention.universe, [0.3, 0.5, 0.7])
+        self.profit_retention['medium'] = fuzz.trimf(self.profit_retention.universe, [0.6, 0.8, 0.95])
+        self.profit_retention['high'] = fuzz.trimf(self.profit_retention.universe, [0.9, 1.0, 1.1])
+        self.profit_retention['peak'] = fuzz.trapmf(self.profit_retention.universe, [1.05, 1.15, 1.2, 1.2])
 
-    def _trapmf(self, x: float, a: float, b: float, c: float, d: float) -> float:
-        """Trapezoidal membership function.
+        # RSI (0-100)
+        self.rsi['oversold'] = fuzz.trapmf(self.rsi.universe, [0, 0, 20, 30])
+        self.rsi['low'] = fuzz.trimf(self.rsi.universe, [20, 35, 45])
+        self.rsi['neutral'] = fuzz.trimf(self.rsi.universe, [40, 50, 60])
+        self.rsi['high'] = fuzz.trimf(self.rsi.universe, [55, 65, 80])
+        self.rsi['overbought'] = fuzz.trapmf(self.rsi.universe, [70, 80, 100, 100])
 
-        Args:
-            x: Input value.
-            a: Left foot.
-            b: Left shoulder (start of plateau).
-            c: Right shoulder (end of plateau).
-            d: Right foot.
+        # TIME IN TRADE (minutes)
+        self.time_in_trade['very_short'] = fuzz.trapmf(self.time_in_trade.universe, [0, 0, 3, 5])
+        self.time_in_trade['short'] = fuzz.trimf(self.time_in_trade.universe, [3, 7, 12])
+        self.time_in_trade['medium'] = fuzz.trimf(self.time_in_trade.universe, [10, 15, 25])
+        self.time_in_trade['long'] = fuzz.trimf(self.time_in_trade.universe, [20, 35, 50])
+        self.time_in_trade['very_long'] = fuzz.trapmf(self.time_in_trade.universe, [45, 55, 60, 60])
 
-        Returns:
-            Membership degree in [0, 1].
-        """
-        if x <= a or x >= d:
-            return 0.0
-        if b <= x <= c:
-            return 1.0
-        if x < b:
-            return (x - a) / (b - a) if b != a else 1.0
-        return (d - x) / (d - c) if d != c else 1.0
+        # PROFIT LEVEL (profit / tp_target)
+        self.profit_level['none'] = fuzz.trapmf(self.profit_level.universe, [0, 0, 0.1, 0.2])
+        self.profit_level['small'] = fuzz.trimf(self.profit_level.universe, [0.1, 0.3, 0.5])
+        self.profit_level['medium'] = fuzz.trimf(self.profit_level.universe, [0.4, 0.6, 0.8])
+        self.profit_level['high'] = fuzz.trimf(self.profit_level.universe, [0.7, 0.9, 1.1])
+        self.profit_level['exceeded'] = fuzz.trapmf(self.profit_level.universe, [1.0, 1.2, 2.0, 2.0])
 
-    # ------------------------------------------------------------------
-    # Per-input fuzzy sets
-    # ------------------------------------------------------------------
+        # EXIT CONFIDENCE (0-1)
+        self.exit_confidence['very_low'] = fuzz.trimf(self.exit_confidence.universe, [0, 0, 0.25])
+        self.exit_confidence['low'] = fuzz.trimf(self.exit_confidence.universe, [0.1, 0.3, 0.5])
+        self.exit_confidence['medium'] = fuzz.trimf(self.exit_confidence.universe, [0.4, 0.6, 0.75])
+        self.exit_confidence['high'] = fuzz.trimf(self.exit_confidence.universe, [0.65, 0.8, 0.95])
+        self.exit_confidence['very_high'] = fuzz.trapmf(self.exit_confidence.universe, [0.85, 0.95, 1.0, 1.0])
 
-    def _profit_membership(self, profit_pips: float) -> dict[str, float]:
-        """Classify profit level into fuzzy sets.
+    def _create_rule_base(self):
+        """Create 30+ fuzzy rules for exit decisions."""
+        rules = []
 
-        Args:
-            profit_pips: Current profit in pips (can be negative).
+        # === VELOCITY-BASED RULES (highest priority) ===
+        # Rule 1: Crashing velocity = immediate exit
+        rules.append(ctrl.Rule(
+            self.velocity['crashing'],
+            self.exit_confidence['very_high']
+        ))
 
-        Returns:
-            Dict with keys 'loss', 'small', 'moderate', 'high'.
-        """
-        return {
-            "loss": self._trapmf(profit_pips, -200.0, -50.0, 0.0, 5.0),
-            "small": self._trimf(profit_pips, 0.0, 10.0, 30.0),
-            "moderate": self._trimf(profit_pips, 20.0, 50.0, 100.0),
-            "high": self._trapmf(profit_pips, 80.0, 120.0, 500.0, 500.0),
-        }
+        # Rule 2: Declining velocity + negative acceleration = high exit
+        rules.append(ctrl.Rule(
+            self.velocity['declining'] & self.acceleration['negative'],
+            self.exit_confidence['high']
+        ))
 
-    def _time_membership(self, hours: float) -> dict[str, float]:
-        """Classify time in trade into fuzzy sets.
+        # Rule 3: Declining velocity + collapsed retention = very high exit
+        rules.append(ctrl.Rule(
+            self.velocity['declining'] & self.profit_retention['collapsed'],
+            self.exit_confidence['very_high']
+        ))
 
-        Args:
-            hours: Hours since trade entry.
+        # Rule 4: Stalling velocity + low retention = medium exit
+        rules.append(ctrl.Rule(
+            self.velocity['stalling'] & self.profit_retention['low'],
+            self.exit_confidence['medium']
+        ))
 
-        Returns:
-            Dict with keys 'short', 'medium', 'long'.
-        """
-        return {
-            "short": self._trapmf(hours, 0.0, 0.0, 1.0, 3.0),
-            "medium": self._trimf(hours, 2.0, 6.0, 12.0),
-            "long": self._trapmf(hours, 10.0, 18.0, 48.0, 48.0),
-        }
+        # Rule 5: Stalling velocity + long time = high exit
+        rules.append(ctrl.Rule(
+            self.velocity['stalling'] & self.time_in_trade['long'],
+            self.exit_confidence['high']
+        ))
 
-    def _momentum_membership(self, momentum: float) -> dict[str, float]:
-        """Classify momentum score into fuzzy sets.
+        # === ACCELERATION-BASED RULES ===
+        # Rule 6: Strong negative accel + medium profit = high exit
+        rules.append(ctrl.Rule(
+            self.acceleration['strong_negative'] & self.profit_level['medium'],
+            self.exit_confidence['high']
+        ))
 
-        Args:
-            momentum: Momentum score in [-1, 1]; positive = bullish.
+        # Rule 7: Negative accel + declining velocity = high exit
+        rules.append(ctrl.Rule(
+            self.acceleration['negative'] & self.velocity['declining'],
+            self.exit_confidence['high']
+        ))
 
-        Returns:
-            Dict with keys 'strong_against', 'weak', 'neutral', 'strong_with'.
-        """
-        return {
-            "strong_against": self._trapmf(momentum, -1.0, -1.0, -0.5, -0.2),
-            "weak": self._trimf(momentum, -0.4, -0.1, 0.2),
-            "neutral": self._trimf(momentum, -0.2, 0.0, 0.2),
-            "strong_with": self._trapmf(momentum, 0.2, 0.5, 1.0, 1.0),
-        }
+        # === PROFIT RETENTION RULES ===
+        # Rule 8: Collapsed retention (regardless of velocity) = very high exit
+        rules.append(ctrl.Rule(
+            self.profit_retention['collapsed'],
+            self.exit_confidence['very_high']
+        ))
 
-    def _volatility_membership(self, volatility: float) -> dict[str, float]:
-        """Classify volatility level into fuzzy sets.
+        # Rule 9: Low retention + stalling velocity = high exit
+        rules.append(ctrl.Rule(
+            self.profit_retention['low'] & self.velocity['stalling'],
+            self.exit_confidence['high']
+        ))
 
-        Args:
-            volatility: Normalised volatility score in [0, 1].
+        # Rule 10: Low retention + medium time = medium exit
+        rules.append(ctrl.Rule(
+            self.profit_retention['low'] & self.time_in_trade['medium'],
+            self.exit_confidence['medium']
+        ))
 
-        Returns:
-            Dict with keys 'low', 'normal', 'high'.
-        """
-        return {
-            "low": self._trapmf(volatility, 0.0, 0.0, 0.2, 0.4),
-            "normal": self._trimf(volatility, 0.3, 0.5, 0.7),
-            "high": self._trapmf(volatility, 0.6, 0.8, 1.0, 1.0),
-        }
+        # === RSI REVERSAL RULES (position-dependent) ===
+        # Rule 11: Oversold RSI + high profit (SELL position exiting at support) = high exit
+        rules.append(ctrl.Rule(
+            self.rsi['oversold'] & self.profit_retention['high'],
+            self.exit_confidence['high']
+        ))
 
-    def _smc_membership(self, smc_signal: float) -> dict[str, float]:
-        """Classify SMC signal into fuzzy sets.
+        # Rule 12: Overbought RSI + high profit (BUY position exiting at resistance) = high exit
+        rules.append(ctrl.Rule(
+            self.rsi['overbought'] & self.profit_retention['high'],
+            self.exit_confidence['high']
+        ))
 
-        Args:
-            smc_signal: SMC bias in [-1, 1]; positive = bullish structure.
+        # Rule 13: Oversold RSI + low retention (SELL position, price bouncing) = medium exit
+        rules.append(ctrl.Rule(
+            self.rsi['oversold'] & self.profit_retention['low'],
+            self.exit_confidence['medium']
+        ))
 
-        Returns:
-            Dict with keys 'bearish', 'neutral', 'bullish'.
-        """
-        return {
-            "bearish": self._trapmf(smc_signal, -1.0, -1.0, -0.3, 0.0),
-            "neutral": self._trimf(smc_signal, -0.3, 0.0, 0.3),
-            "bullish": self._trapmf(smc_signal, 0.0, 0.3, 1.0, 1.0),
-        }
+        # === TIME-BASED RULES ===
+        # Rule 14: Very long time + stalling velocity = high exit (trade exhausted)
+        rules.append(ctrl.Rule(
+            self.time_in_trade['very_long'] & self.velocity['stalling'],
+            self.exit_confidence['high']
+        ))
 
-    # ------------------------------------------------------------------
-    # Rule evaluation
-    # ------------------------------------------------------------------
+        # Rule 15: Long time + low retention = high exit
+        rules.append(ctrl.Rule(
+            self.time_in_trade['long'] & self.profit_retention['low'],
+            self.exit_confidence['high']
+        ))
 
-    def _evaluate_rules(
-        self,
-        profit: dict[str, float],
-        time: dict[str, float],
-        momentum: dict[str, float],
-        volatility: dict[str, float],
-        smc: dict[str, float],
-    ) -> list[tuple[float, float]]:
-        """Evaluate fuzzy rules and return (strength, output_centroid) pairs.
+        # Rule 16: Medium time + collapsed retention = very high exit
+        rules.append(ctrl.Rule(
+            self.time_in_trade['medium'] & self.profit_retention['collapsed'],
+            self.exit_confidence['very_high']
+        ))
 
-        Rules are defined as (antecedent_strength, output_location) where
-        output_location is the centre of the output singleton on [0, 1].
+        # === PROFIT LEVEL RULES ===
+        # Rule 17: Exceeded profit + declining velocity = high exit (take profit)
+        rules.append(ctrl.Rule(
+            self.profit_level['exceeded'] & self.velocity['declining'],
+            self.exit_confidence['high']
+        ))
 
-        Args:
-            profit: Profit membership values.
-            time: Time membership values.
-            momentum: Momentum membership values.
-            volatility: Volatility membership values.
-            smc: SMC signal membership values.
+        # Rule 18: High profit + stalling velocity = medium exit
+        rules.append(ctrl.Rule(
+            self.profit_level['high'] & self.velocity['stalling'],
+            self.exit_confidence['medium']
+        ))
 
-        Returns:
-            List of (firing_strength, output_value) tuples.
-        """
-        rules: list[tuple[float, float]] = []
+        # Rule 19: High profit + strong negative accel = high exit
+        rules.append(ctrl.Rule(
+            self.profit_level['high'] & self.acceleration['strong_negative'],
+            self.exit_confidence['high']
+        ))
 
-        # Rule 1: High profit AND weakening/against momentum → EXIT (strong)
-        r1 = min(profit["high"], momentum["strong_against"])
-        rules.append((r1, 0.90))
+        # === POSITIVE SCENARIOS (low exit confidence) ===
+        # Rule 20: Growing velocity + high retention = very low exit (hold)
+        rules.append(ctrl.Rule(
+            self.velocity['growing'] & self.profit_retention['high'],
+            self.exit_confidence['very_low']
+        ))
 
-        # Rule 2: High profit AND weak momentum → EXIT
-        r2 = min(profit["high"], momentum["weak"])
-        rules.append((r2, 0.80))
+        # Rule 21: Accelerating velocity + positive accel = very low exit (strong trend)
+        rules.append(ctrl.Rule(
+            self.velocity['accelerating'] & self.acceleration['positive'],
+            self.exit_confidence['very_low']
+        ))
 
-        # Rule 3: Moderate profit AND strong against momentum → EXIT
-        r3 = min(profit["moderate"], momentum["strong_against"])
-        rules.append((r3, 0.75))
+        # Rule 22: Peak retention + growing velocity = very low exit (at new high)
+        rules.append(ctrl.Rule(
+            self.profit_retention['peak'] & self.velocity['growing'],
+            self.exit_confidence['very_low']
+        ))
 
-        # Rule 4: Long time AND low volatility (ranging) → EXIT
-        r4 = min(time["long"], volatility["low"])
-        rules.append((r4, 0.70))
+        # === COMBINATION RULES (weak signals together) ===
+        # Rule 23: Stalling + neutral accel + medium retention + long time = medium exit
+        rules.append(ctrl.Rule(
+            self.velocity['stalling'] & self.acceleration['neutral'] &
+            self.profit_retention['medium'] & self.time_in_trade['long'],
+            self.exit_confidence['medium']
+        ))
 
-        # Rule 5: Long time AND neutral momentum → EXIT
-        r5 = min(time["long"], momentum["neutral"])
-        rules.append((r5, 0.65))
+        # Rule 24: Declining + negative accel + low retention = very high exit (triple threat)
+        rules.append(ctrl.Rule(
+            self.velocity['declining'] & self.acceleration['negative'] &
+            self.profit_retention['low'],
+            self.exit_confidence['very_high']
+        ))
 
-        # Rule 6: High profit AND bearish SMC (for a long) → EXIT
-        r6 = min(profit["high"], smc["bearish"])
-        rules.append((r6, 0.85))
+        # Rule 25: Small profit + very long time + stalling = high exit (cut losses)
+        rules.append(ctrl.Rule(
+            self.profit_level['small'] & self.time_in_trade['very_long'] &
+            self.velocity['stalling'],
+            self.exit_confidence['high']
+        ))
 
-        # Rule 7: Moderate profit AND bearish SMC → EXIT
-        r7 = min(profit["moderate"], smc["bearish"])
-        rules.append((r7, 0.60))
+        # === EARLY EXIT RULES (prevent holding too long) ===
+        # Rule 26: Medium profit + declining + long time = high exit
+        rules.append(ctrl.Rule(
+            self.profit_level['medium'] & self.velocity['declining'] &
+            self.time_in_trade['long'],
+            self.exit_confidence['high']
+        ))
 
-        # Rule 8: High volatility AND loss → HOLD / reduce exit desire
-        r8 = min(volatility["high"], profit["loss"])
-        rules.append((r8, 0.30))
+        # Rule 27: High profit + low retention + declining = very high exit (protect gains)
+        rules.append(ctrl.Rule(
+            self.profit_level['high'] & self.profit_retention['low'] &
+            self.velocity['declining'],
+            self.exit_confidence['very_high']
+        ))
 
-        # Rule 9: Small profit AND strong momentum with trade → HOLD
-        r9 = min(profit["small"], momentum["strong_with"])
-        rules.append((r9, 0.20))
+        # === DEFENSIVE RULES (prevent premature exit) ===
+        # Rule 28: Short time + growing velocity = very low exit (give time to develop)
+        rules.append(ctrl.Rule(
+            self.time_in_trade['short'] & self.velocity['growing'],
+            self.exit_confidence['very_low']
+        ))
 
-        # Rule 10: Short time AND strong momentum → HOLD
-        r10 = min(time["short"], momentum["strong_with"])
-        rules.append((r10, 0.15))
+        # Rule 29: Very short time + high retention = very low exit (just started)
+        rules.append(ctrl.Rule(
+            self.time_in_trade['very_short'] & self.profit_retention['high'],
+            self.exit_confidence['very_low']
+        ))
+
+        # Rule 30: Medium profit + accelerating velocity = low exit (let it run)
+        rules.append(ctrl.Rule(
+            self.profit_level['medium'] & self.velocity['accelerating'],
+            self.exit_confidence['low']
+        ))
 
         return rules
 
-    # ------------------------------------------------------------------
-    # Defuzzification
-    # ------------------------------------------------------------------
-
-    def _centroid_defuzzify(self, rules: list[tuple[float, float]]) -> float:
-        """Centroid defuzzification over singleton outputs.
-
-        Args:
-            rules: List of (firing_strength, output_value) from rule evaluation.
-
-        Returns:
-            Defuzzified crisp output in [0, 1].
-        """
-        numerator = sum(strength * value for strength, value in rules)
-        denominator = sum(strength for strength, _ in rules)
-        if denominator == 0.0:
-            return 0.0
-        return numerator / denominator
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
-    def calculate_exit_score(
-        self,
-        profit_pips: float,
-        time_in_trade_hours: float,
-        momentum_score: float,
-        volatility: float,
-        smc_signal: float,
-    ) -> float:
-        """Calculate fuzzy exit score.
-
-        Args:
-            profit_pips: Current trade profit in pips (negative = loss).
-            time_in_trade_hours: Hours since entry.
-            momentum_score: Directional momentum in [-1, 1].
-            volatility: Normalised volatility in [0, 1].
-            smc_signal: SMC structural bias in [-1, 1].
-
-        Returns:
-            Exit score in [0.0, 1.0]; higher means stronger exit signal.
-        """
-        profit = self._profit_membership(profit_pips)
-        time = self._time_membership(time_in_trade_hours)
-        momentum = self._momentum_membership(momentum_score)
-        vol = self._volatility_membership(volatility)
-        smc = self._smc_membership(smc_signal)
-
-        rules = self._evaluate_rules(profit, time, momentum, vol, smc)
-        score = self._centroid_defuzzify(rules)
-        logger.debug("Fuzzy exit score: %.3f", score)
-        return round(score, 4)
-
-    def should_exit(
-        self,
-        profit_pips: float,
-        time_hours: float,
-        momentum: float,
-        volatility: float,
-        smc_score: float,
-    ) -> bool:
-        """Return True if fuzzy logic recommends exiting the trade.
-
-        Args:
-            profit_pips: Current profit in pips.
-            time_hours: Hours in trade.
-            momentum: Directional momentum score in [-1, 1].
-            volatility: Normalised volatility in [0, 1].
-            smc_score: SMC structural bias in [-1, 1].
-
-        Returns:
-            True if exit is recommended.
-        """
-        score = self.calculate_exit_score(
-            profit_pips, time_hours, momentum, volatility, smc_score
-        )
-        return score >= self.exit_threshold
-
     def evaluate(
         self,
-        profit_pips: float,
-        time_in_trade_hours: float,
-        momentum_score: float,
-        volatility: float,
-        smc_signal: float,
-    ) -> FuzzyExitScore:
-        """Full evaluation returning a structured result.
+        velocity: float,
+        acceleration: float,
+        profit_retention: float,
+        rsi: float,
+        time_in_trade: float,
+        profit_level: float,
+    ) -> float:
+        """
+        Evaluate exit confidence for current trade state.
 
         Args:
-            profit_pips: Current profit in pips.
-            time_in_trade_hours: Hours since entry.
-            momentum_score: Directional momentum in [-1, 1].
-            volatility: Normalised volatility in [0, 1].
-            smc_signal: SMC structural bias in [-1, 1].
+            velocity: Profit velocity ($/second)
+            acceleration: Profit acceleration ($/s²)
+            profit_retention: current_profit / peak_profit
+            rsi: RSI indicator (0-100)
+            time_in_trade: Minutes since entry
+            profit_level: profit / tp_target
 
         Returns:
-            FuzzyExitScore with score, decision and reason.
+            Exit confidence (0.0-1.0)
+            > 0.75: High confidence, exit now
+            0.50-0.75: Medium confidence, warning
+            < 0.50: Low confidence, hold
         """
-        score = self.calculate_exit_score(
-            profit_pips, time_in_trade_hours, momentum_score, volatility, smc_signal
-        )
-        exit_flag = score >= self.exit_threshold
+        # Clamp inputs to universe ranges
+        velocity = np.clip(velocity, -0.5, 0.5)
+        acceleration = np.clip(acceleration, -0.01, 0.01)
+        profit_retention = np.clip(profit_retention, 0, 1.2)
+        rsi = np.clip(rsi, 0, 100)
+        time_in_trade = np.clip(time_in_trade, 0, 60)
+        profit_level = np.clip(profit_level, 0, 2.0)
 
-        if score >= 0.75:
-            reason = "Strong exit signal – high score from multiple converging rules"
-        elif score >= self.exit_threshold:
-            reason = "Moderate exit signal – threshold crossed"
-        else:
-            reason = "Hold – insufficient exit signal"
+        # Set inputs
+        self.simulation.input['velocity'] = velocity
+        self.simulation.input['accel'] = acceleration
+        self.simulation.input['retention'] = profit_retention
+        self.simulation.input['rsi'] = rsi
+        self.simulation.input['time'] = time_in_trade
+        self.simulation.input['profit_lvl'] = profit_level
 
-        return FuzzyExitScore(score=score, should_exit=exit_flag, reason=reason)
+        # Compute output
+        try:
+            self.simulation.compute()
+            return float(self.simulation.output['exit_conf'])
+        except Exception as e:
+            # Fallback: if fuzzy system fails, return conservative confidence
+            # (likely due to no rules firing)
+            return 0.3
+
+    def visualize(self, variable_name: str):
+        """
+        Visualize membership functions for a variable.
+
+        Args:
+            variable_name: 'velocity', 'accel', 'retention', 'rsi', 'time', 'profit_lvl', 'exit_conf'
+        """
+        import matplotlib.pyplot as plt
+
+        var_map = {
+            'velocity': self.velocity,
+            'accel': self.acceleration,
+            'retention': self.profit_retention,
+            'rsi': self.rsi,
+            'time': self.time_in_trade,
+            'profit_lvl': self.profit_level,
+            'exit_conf': self.exit_confidence,
+        }
+
+        if variable_name not in var_map:
+            raise ValueError(f"Unknown variable: {variable_name}")
+
+        var = var_map[variable_name]
+        var.view()
+        plt.show()

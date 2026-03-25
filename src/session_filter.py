@@ -1,291 +1,333 @@
-"""Trading session filter for XAUUSD.
+"""
+Trading Session Filter
+======================
+Filter trades based on market sessions and optimal trading hours.
+Timezone: WIB (Waktu Indonesia Barat) - GMT+7 for Batam/Jakarta.
 
-Determines whether trading is allowed based on the current UTC time,
-active Forex session, London/NY overlap windows, and news blackout periods.
+Optimal Trading Hours for XAUUSD:
+- London-NY Overlap: 20:00 - 00:00 WIB (BEST)
+- London Session: 15:00 - 00:00 WIB
+- NY Session: 20:00 - 05:00 WIB
+
+Dangerous Zones:
+- Rollover/Spread Wide: 04:00 - 06:00 WIB
+- Low Liquidity: 00:00 - 04:00 WIB
+- Friday Close: After 23:00 WIB Friday
 """
 
-from __future__ import annotations
+from datetime import datetime, time, timedelta
+from typing import Tuple, Dict, Optional
+from dataclasses import dataclass
+from enum import Enum
+from loguru import logger
+import pytz
 
-import logging
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
 
-from src.utils import utc_now
-
-logger = logging.getLogger(__name__)
-
-# Session window definitions: (start_hour_utc, end_hour_utc)
-TOKYO_SESSION:  Tuple[int, int] = (0,  9)
-LONDON_SESSION: Tuple[int, int] = (7, 16)
-NY_SESSION:     Tuple[int, int] = (13, 22)
-OVERLAP_LONDON_NY: Tuple[int, int] = (13, 16)
-
-# Volatility multipliers per session
-SESSION_VOLATILITY: Dict[str, float] = {
-    "TOKYO":           0.7,
-    "LONDON":          1.2,
-    "NEW_YORK":        1.2,
-    "LONDON_NY_OVERLAP": 1.5,
-    "OFF_HOURS":       0.4,
-}
+class TradingSession(Enum):
+    """Market trading sessions."""
+    SYDNEY = "sydney"
+    TOKYO = "tokyo"
+    LONDON = "london"
+    NEW_YORK = "new_york"
+    OVERLAP_TOKYO_LONDON = "tokyo_london_overlap"
+    OVERLAP_LONDON_NY = "london_ny_overlap"
+    OFF_HOURS = "off_hours"
 
 
 @dataclass
-class NewsEvent:
-    """A single high-impact news blackout window.
-
-    Attributes:
-        event_time: UTC datetime when the news releases.
-        duration_minutes: Total blackout window in minutes (split before/after).
-        description: Human-readable event description.
-    """
-
-    event_time: datetime
-    duration_minutes: int = 60
-    description: str = ""
-
-    @property
-    def blackout_start(self) -> datetime:
-        """Start of the blackout window (half duration before event)."""
-        return self.event_time - timedelta(minutes=self.duration_minutes // 2)
-
-    @property
-    def blackout_end(self) -> datetime:
-        """End of the blackout window (half duration after event)."""
-        return self.event_time + timedelta(minutes=self.duration_minutes // 2)
+class SessionConfig:
+    """Session trading configuration."""
+    name: str
+    start_hour: int  # WIB
+    start_minute: int
+    end_hour: int    # WIB
+    end_minute: int
+    volatility: str  # "low", "medium", "high", "extreme"
+    allow_trading: bool
+    position_size_multiplier: float
 
 
 class SessionFilter:
-    """Determines trading eligibility based on session and news rules.
+    """
+    Trading session filter for optimal trading hours.
 
-    Trading is only permitted during active Forex sessions on weekdays,
-    with enhanced conditions during the London/NY overlap. News events
-    create automatic blackout windows around their scheduled times.
-
-    Attributes:
-        allowed_sessions: Set of session names permitted for trading.
-        news_events: Registered news blackout windows.
+    Configured for XAUUSD aggressive trading during London/NY overlap.
+    All times in WIB (GMT+7).
     """
 
     def __init__(
         self,
-        allowed_sessions: Optional[List[str]] = None,
-        allow_off_hours: bool = False,
-    ) -> None:
-        """Initialise the session filter.
+        timezone: str = "Asia/Jakarta",  # WIB
+        aggressive_mode: bool = True,     # Focus on high volatility
+    ):
+        self.tz = pytz.timezone(timezone)
+        self.aggressive_mode = aggressive_mode
 
-        Args:
-            allowed_sessions: Session names to trade in. Defaults to LONDON,
-                NEW_YORK, and LONDON_NY_OVERLAP.
-            allow_off_hours: Whether to permit trading outside named sessions.
-        """
-        self.allowed_sessions: List[str] = allowed_sessions or [
-            "LONDON", "NEW_YORK", "LONDON_NY_OVERLAP"
+        # Define trading windows (WIB)
+        self.sessions = {
+            # Main sessions
+            TradingSession.SYDNEY: SessionConfig(
+                name="Sydney",
+                start_hour=6, start_minute=0,  # Start after rollover (skip 04:00-06:00)
+                end_hour=13, end_minute=0,
+                volatility="low",
+                allow_trading=True,  # ENABLED - backtest shows $5,934 profit!
+                position_size_multiplier=0.5,  # HALF lot size for safety
+            ),
+            TradingSession.TOKYO: SessionConfig(
+                name="Tokyo",
+                start_hour=7, start_minute=0,
+                end_hour=16, end_minute=0,
+                volatility="medium",
+                allow_trading=True,
+                position_size_multiplier=0.7,
+            ),
+            TradingSession.LONDON: SessionConfig(
+                name="London",
+                start_hour=15, start_minute=0,
+                end_hour=23, end_minute=59,
+                volatility="high",
+                allow_trading=True,
+                position_size_multiplier=1.0,
+            ),
+            TradingSession.NEW_YORK: SessionConfig(
+                name="New York",
+                start_hour=20, start_minute=0,
+                end_hour=23, end_minute=59,  # NY continues past midnight
+                volatility="extreme",
+                allow_trading=True,
+                position_size_multiplier=1.0,
+            ),
+            # Overlap sessions (BEST TIMES)
+            TradingSession.OVERLAP_TOKYO_LONDON: SessionConfig(
+                name="Tokyo-London Overlap",
+                start_hour=15, start_minute=0,
+                end_hour=16, end_minute=0,
+                volatility="high",
+                allow_trading=True,
+                position_size_multiplier=0.7,
+            ),
+            TradingSession.OVERLAP_LONDON_NY: SessionConfig(
+                name="London-NY Overlap (GOLDEN)",
+                start_hour=20, start_minute=0,
+                end_hour=23, end_minute=59,
+                volatility="extreme",
+                allow_trading=True,
+                position_size_multiplier=1.2,  # Boost during golden hours
+            ),
+        }
+
+        # Danger zones (WIB)
+        self.danger_zones = [
+            # Rollover - spread extremely wide
+            {"name": "Rollover", "start": (4, 0), "end": (6, 0), "reason": "Spread melebar saat rollover"},
+            # Low liquidity
+            {"name": "Dead Zone", "start": (0, 0), "end": (4, 0), "reason": "Likuiditas rendah, spread tinggi"},
         ]
-        self.allow_off_hours = allow_off_hours
-        self.news_events: List[NewsEvent] = []
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+        # High impact news times to avoid (typical release times in WIB)
+        self.news_blackout_times = [
+            # NFP - First Friday of month
+            {"event": "NFP", "hour": 19, "minute": 30, "buffer_before": 15, "buffer_after": 30},
+            # Fed Interest Rate
+            {"event": "FOMC", "hour": 1, "minute": 0, "buffer_before": 15, "buffer_after": 45},
+            # US CPI
+            {"event": "CPI", "hour": 19, "minute": 30, "buffer_before": 15, "buffer_after": 30},
+        ]
 
-    def get_current_session(self, now: Optional[datetime] = None) -> str:
-        """Identify the dominant Forex trading session at the given time.
+    def get_current_time_wib(self) -> datetime:
+        """Get current time in WIB."""
+        return datetime.now(self.tz)
 
-        The London/NY overlap takes precedence when both sessions are active.
-
-        Args:
-            now: UTC datetime to evaluate. Uses current UTC time if None.
-
-        Returns:
-            str: Session name: one of TOKYO, LONDON, NEW_YORK,
-                LONDON_NY_OVERLAP, or OFF_HOURS.
+    def get_current_session(self) -> Tuple[TradingSession, SessionConfig]:
         """
-        now = now or utc_now()
+        Get the current trading session.
+
+        Returns highest priority session if multiple overlap.
+        Priority: Overlap > London/NY > Tokyo > Sydney > Off Hours
+        """
+        now = self.get_current_time_wib()
         hour = now.hour
+        minute = now.minute
+        current_time = hour * 60 + minute
 
-        in_london = LONDON_SESSION[0] <= hour < LONDON_SESSION[1]
-        in_ny = NY_SESSION[0] <= hour < NY_SESSION[1]
-        in_overlap = OVERLAP_LONDON_NY[0] <= hour < OVERLAP_LONDON_NY[1]
-        in_tokyo = TOKYO_SESSION[0] <= hour < TOKYO_SESSION[1]
+        # Check overlaps first (highest priority)
+        if 20 * 60 <= current_time <= 24 * 60:  # 20:00 - 00:00
+            return TradingSession.OVERLAP_LONDON_NY, self.sessions[TradingSession.OVERLAP_LONDON_NY]
 
-        if in_overlap:
-            return "LONDON_NY_OVERLAP"
-        if in_london:
-            return "LONDON"
-        if in_ny:
-            return "NEW_YORK"
-        if in_tokyo:
-            return "TOKYO"
-        return "OFF_HOURS"
+        if 15 * 60 <= current_time <= 16 * 60:  # 15:00 - 16:00
+            return TradingSession.OVERLAP_TOKYO_LONDON, self.sessions[TradingSession.OVERLAP_TOKYO_LONDON]
 
-    def is_trading_allowed(self, now: Optional[datetime] = None) -> bool:
-        """Return whether a new trade entry is currently permitted.
+        # Check main sessions
+        for session, config in self.sessions.items():
+            if session in [TradingSession.OVERLAP_LONDON_NY, TradingSession.OVERLAP_TOKYO_LONDON]:
+                continue
 
-        A trade is blocked if:
-        - It is the weekend
-        - The session is not in ``allowed_sessions``
-        - A news blackout window is active
+            start = config.start_hour * 60 + config.start_minute
+            end = config.end_hour * 60 + config.end_minute
 
-        Args:
-            now: UTC datetime to evaluate. Uses current UTC time if None.
+            if start <= current_time <= end:
+                return session, config
 
-        Returns:
-            bool: True when trading is allowed.
-        """
-        now = now or utc_now()
+        # Off hours
+        return TradingSession.OFF_HOURS, SessionConfig(
+            name="Off Hours",
+            start_hour=0, start_minute=0,
+            end_hour=0, end_minute=0,
+            volatility="low",
+            allow_trading=False,
+            position_size_multiplier=0.0,
+        )
 
-        if self.is_weekend(now):
-            logger.debug("Trading blocked: weekend.")
-            return False
+    def is_danger_zone(self) -> Tuple[bool, str]:
+        """Check if current time is in a danger zone."""
+        now = self.get_current_time_wib()
+        hour = now.hour
+        minute = now.minute
+        current_time = hour * 60 + minute
 
-        session = self.get_current_session(now)
-        if session == "OFF_HOURS" and not self.allow_off_hours:
-            logger.debug("Trading blocked: off-hours.")
-            return False
+        for zone in self.danger_zones:
+            start = zone["start"][0] * 60 + zone["start"][1]
+            end = zone["end"][0] * 60 + zone["end"][1]
 
-        if session not in self.allowed_sessions and session != "LONDON_NY_OVERLAP":
-            logger.debug("Trading blocked: session %s not in allowed list.", session)
-            return False
+            if start <= current_time < end:
+                return True, zone["reason"]
 
-        if self.is_news_blackout(now):
-            logger.debug("Trading blocked: news blackout.")
-            return False
+        return False, ""
 
-        return True
-
-    def get_session_volatility_multiplier(self, now: Optional[datetime] = None) -> float:
-        """Return a volatility scaling factor for the current session.
-
-        Higher values indicate more volatile sessions where stop-loss
-        distances should be widened proportionally.
-
-        Args:
-            now: UTC datetime to evaluate. Uses current UTC time if None.
-
-        Returns:
-            float: Volatility multiplier (0.4 – 1.5).
-        """
-        session = self.get_current_session(now or utc_now())
-        return SESSION_VOLATILITY.get(session, 0.4)
-
-    def is_news_blackout(self, now: Optional[datetime] = None) -> bool:
-        """Check whether a registered news event blackout is active.
-
-        Args:
-            now: UTC datetime to evaluate. Uses current UTC time if None.
-
-        Returns:
-            bool: True when currently inside a news blackout window.
-        """
-        now = now or utc_now()
-        # Make now timezone-aware if not already
-        if now.tzinfo is None:
-            from datetime import timezone
-            now = now.replace(tzinfo=timezone.utc)
-        for event in self.news_events:
-            start = event.blackout_start
-            end = event.blackout_end
-            # Ensure start/end are timezone-aware
-            if start.tzinfo is None:
-                from datetime import timezone
-                start = start.replace(tzinfo=timezone.utc)
-                end = end.replace(tzinfo=timezone.utc)
-            if start <= now <= end:
-                logger.info("News blackout active: %s", event.description)
-                return True
+    def is_friday_close(self) -> bool:
+        """Check if approaching Friday market close (Saturday 05:00 WIB)."""
+        now = self.get_current_time_wib()
+        # Market closes Saturday 05:00 WIB — only block 30 min before
+        # Saturday 04:30+ WIB
+        if now.weekday() == 5 and now.hour == 4 and now.minute >= 30:
+            return True
         return False
 
-    def is_weekend(self, now: Optional[datetime] = None) -> bool:
-        """Check whether the current day is a weekend (Sat/Sun UTC).
+    def is_weekend(self) -> bool:
+        """Check if market is closed (weekend)."""
+        now = self.get_current_time_wib()
+        weekday = now.weekday()
 
-        Args:
-            now: UTC datetime to evaluate. Uses current UTC time if None.
+        # Saturday full day
+        if weekday == 5:
+            return True
+        # Sunday until 04:00 WIB Monday
+        if weekday == 6:
+            return True
+        # Saturday early morning (before market close at 05:00)
+        if weekday == 5 and now.hour < 5:
+            return False  # Market still open
+
+        return False
+
+    def can_trade(self) -> Tuple[bool, str, float]:
+        """
+        Check if trading is allowed right now.
 
         Returns:
-            bool: True on Saturday or Sunday.
+            Tuple of (can_trade, reason, position_multiplier)
         """
-        now = now or utc_now()
-        return now.weekday() >= 5  # 5=Saturday, 6=Sunday
+        now = self.get_current_time_wib()
 
-    def add_news_event(
-        self,
-        event_time: datetime,
-        duration_minutes: int = 60,
-        description: str = "",
-    ) -> None:
-        """Register a news event to create an automatic blackout window.
+        # Check weekend
+        if self.is_weekend():
+            return False, "Market tutup (weekend)", 0.0
 
-        The blackout window spans ``duration_minutes / 2`` before and after
-        the scheduled event time.
+        # Check Friday close
+        if self.is_friday_close():
+            return False, "Mendekati penutupan Jumat - hindari gap weekend", 0.0
 
-        Args:
-            event_time: UTC datetime of the news release.
-            duration_minutes: Total blackout duration in minutes.
-            description: Human-readable description of the event.
-        """
-        event = NewsEvent(
-            event_time=event_time,
-            duration_minutes=duration_minutes,
-            description=description,
-        )
-        self.news_events.append(event)
-        logger.info(
-            "News event added: %s at %s (blackout ±%d min)",
-            description, event_time.isoformat(), duration_minutes // 2,
-        )
+        # Check danger zones
+        is_danger, danger_reason = self.is_danger_zone()
+        if is_danger:
+            return False, f"Zona bahaya: {danger_reason}", 0.0
 
-    def remove_expired_events(self, now: Optional[datetime] = None) -> int:
-        """Purge news events whose blackout windows have already passed.
+        # Get current session
+        session, config = self.get_current_session()
 
-        Args:
-            now: UTC datetime reference. Uses current UTC time if None.
+        if not config.allow_trading:
+            return False, f"Trading tidak diizinkan saat {config.name}", 0.0
 
-        Returns:
-            int: Number of events removed.
-        """
-        from datetime import timezone as _tz
-        now = now or utc_now()
-        if now.tzinfo is None:
-            now = now.replace(tzinfo=_tz.utc)
-        before = len(self.news_events)
-        self.news_events = [e for e in self.news_events if self._aware(e.blackout_end) >= now]
-        removed = before - len(self.news_events)
-        if removed:
-            logger.debug("Removed %d expired news events.", removed)
-        return removed
+        # In aggressive mode, allow medium+ volatility + Sydney (proven profitable)
+        if self.aggressive_mode:
+            # Sydney session is ALLOWED - backtest shows 62% WR, $5,934 profit
+            if session == TradingSession.SYDNEY:
+                return True, f"Trading OK - {config.name} (SAFE MODE: 0.5x lot)", config.position_size_multiplier
+            # Only block low volatility sessions
+            if config.volatility not in ["medium", "high", "extreme"]:
+                return False, f"Mode agresif: tunggu sesi {config.name} (volatilitas {config.volatility})", config.position_size_multiplier
 
-    @staticmethod
-    def _aware(dt: datetime) -> datetime:
-        """Ensure a datetime is timezone-aware (UTC).
+        return True, f"Trading OK - {config.name} ({config.volatility} volatility)", config.position_size_multiplier
 
-        Args:
-            dt: Datetime to normalise.
+    def get_next_trading_window(self) -> Dict:
+        """Get when the next optimal trading window starts."""
+        now = self.get_current_time_wib()
+        current_hour = now.hour
 
-        Returns:
-            datetime: Timezone-aware UTC datetime.
-        """
-        from datetime import timezone as _tz
-        return dt if dt.tzinfo is not None else dt.replace(tzinfo=_tz.utc)
+        # Find next London-NY overlap
+        if current_hour < 20:
+            # Today at 20:00
+            next_window = now.replace(hour=20, minute=0, second=0, microsecond=0)
+            hours_until = 20 - current_hour
+        else:
+            # Tomorrow at 20:00
+            next_window = (now + timedelta(days=1)).replace(hour=20, minute=0, second=0, microsecond=0)
+            hours_until = 24 - current_hour + 20
 
-    def get_session_summary(self, now: Optional[datetime] = None) -> Dict[str, object]:
-        """Return a human-readable summary of the current session state.
-
-        Args:
-            now: UTC datetime reference. Uses current UTC time if None.
-
-        Returns:
-            Dict[str, object]: Session state dictionary.
-        """
-        now = now or utc_now()
-        session = self.get_current_session(now)
         return {
-            "session":              session,
-            "is_weekend":           self.is_weekend(now),
-            "is_trading_allowed":   self.is_trading_allowed(now),
-            "is_news_blackout":     self.is_news_blackout(now),
-            "volatility_multiplier": self.get_session_volatility_multiplier(now),
-            "pending_news_events":  len(self.news_events),
-            "utc_hour":             now.hour,
+            "next_window": next_window.strftime("%Y-%m-%d %H:%M WIB"),
+            "hours_until": hours_until,
+            "session": "London-NY Overlap",
+            "is_weekend": self.is_weekend(),
         }
+
+    def get_status_report(self) -> Dict:
+        """Get comprehensive trading session status."""
+        now = self.get_current_time_wib()
+        session, config = self.get_current_session()
+        can_trade, reason, multiplier = self.can_trade()
+        is_danger, danger_reason = self.is_danger_zone()
+
+        return {
+            "current_time": now.strftime("%Y-%m-%d %H:%M:%S WIB"),
+            "day_of_week": now.strftime("%A"),
+            "current_session": config.name,
+            "volatility": config.volatility,
+            "can_trade": can_trade,
+            "reason": reason,
+            "position_multiplier": multiplier,
+            "is_danger_zone": is_danger,
+            "danger_reason": danger_reason,
+            "is_friday_close": self.is_friday_close(),
+            "is_weekend": self.is_weekend(),
+            "next_window": self.get_next_trading_window(),
+        }
+
+
+# Convenience function
+def create_wib_session_filter(aggressive: bool = True) -> SessionFilter:
+    """Create session filter for WIB timezone."""
+    return SessionFilter(
+        timezone="Asia/Jakarta",
+        aggressive_mode=aggressive,
+    )
+
+
+if __name__ == "__main__":
+    # Test session filter
+    sf = create_wib_session_filter(aggressive=True)
+
+    print("\n" + "=" * 60)
+    print("TRADING SESSION STATUS")
+    print("=" * 60)
+
+    status = sf.get_status_report()
+    for key, value in status.items():
+        print(f"{key}: {value}")
+
+    print("\n" + "=" * 60)
+    can_trade, reason, multiplier = sf.can_trade()
+    print(f"Can Trade: {can_trade}")
+    print(f"Reason: {reason}")
+    print(f"Position Multiplier: {multiplier}")

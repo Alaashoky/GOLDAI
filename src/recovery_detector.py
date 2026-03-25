@@ -1,205 +1,329 @@
-from __future__ import annotations
+"""
+Recovery Strength Detector - Deteksi kekuatan recovery dari loss
+Khusus untuk trade yang recovering dari drawdown
+"""
 
-import logging
-from dataclasses import dataclass, field
-from typing import Optional
-
-import polars as pl
-
-logger = logging.getLogger(__name__)
-
-_MAX_STREAK_LOSS = 10     # cap for normalisation
-_MAX_STREAK_WIN = 5       # win streak cap before increasing risk
-
-
-@dataclass
-class RecoveryState:
-    """Tracks loss/win streaks for the recovery detector.
-
-    Attributes:
-        loss_streak: Consecutive losing trades.
-        win_streak: Consecutive winning trades since last loss.
-        total_trades: Total trades recorded.
-        in_recovery: True when actively recovering from a loss streak.
-        last_result: Last trade result (positive = win).
-    """
-
-    loss_streak: int = 0
-    win_streak: int = 0
-    total_trades: int = 0
-    in_recovery: bool = False
-    last_result: float = 0.0
+import numpy as np
+from typing import List, Tuple, Dict
+from loguru import logger
 
 
 class RecoveryDetector:
-    """Anti-revenge-trading position sizing and setup quality filter.
+    """
+    Analisis kekuatan recovery dari loss positions.
 
-    After a loss streak the risk multiplier is reduced (never increased).
-    Risk is only restored gradually once a winning streak is confirmed,
-    preventing the psychological trap of doubling down to recoup losses.
+    Scenario: Trade went to -$6.39, now at $0.05
+    Question: Apakah recovery akan continue ke profit besar, atau stop di sini?
 
-    Args:
-        recovery_win_streak: Consecutive wins needed to start restoring risk.
-        max_risk_reduction: Floor for risk multiplier (default 0.5 = half size).
-        setup_quality_threshold: Minimum setup score for recovery trades.
+    Strong recovery indicators:
+    1. High recovery percentage (>80% from peak loss)
+    2. Fast recovery velocity (>0.05 $/s average)
+    3. Sustained recovery (not just spike)
+    4. Accelerating recovery (getting faster)
     """
 
-    def __init__(
+    def __init__(self):
+        self.strong_recovery_threshold = 0.8  # 80% recovery from loss
+        self.fast_recovery_velocity = 0.05    # $/second
+        self.min_recovery_samples = 5         # Min data points untuk validate
+
+    def analyze_recovery_strength(
         self,
-        recovery_win_streak: int = 3,
-        max_risk_reduction: float = 0.5,
-        setup_quality_threshold: float = 0.65,
-    ) -> None:
-        self.recovery_win_streak = recovery_win_streak
-        self.max_risk_reduction = max_risk_reduction
-        self.setup_quality_threshold = setup_quality_threshold
-        self._state = RecoveryState()
-
-    # ------------------------------------------------------------------
-    # State updates
-    # ------------------------------------------------------------------
-
-    def update_loss_streak(self, trade_result: float) -> None:
-        """Record a completed trade and update streak counters.
+        profit_history: List[float],
+        peak_loss: float,
+        velocity_history: List[float] = None
+    ) -> Tuple[bool, Dict[str, float]]:
+        """
+        Analisis apakah recovery dari loss cukup kuat untuk continue.
 
         Args:
-            trade_result: P&L of the completed trade (positive = win).
-        """
-        self._state.total_trades += 1
-        self._state.last_result = trade_result
+            profit_history: Recent profit values
+            peak_loss: Peak (worst) loss achieved (negative value)
+            velocity_history: Optional velocity history for trend analysis
 
-        if trade_result < 0:
-            self._state.loss_streak += 1
-            self._state.win_streak = 0
-            if self._state.loss_streak >= 2:
-                self._state.in_recovery = True
-            logger.info(
-                "Loss recorded – streak=%d, in_recovery=%s",
-                self._state.loss_streak,
-                self._state.in_recovery,
-            )
+        Returns:
+            (is_strong_recovery, metrics_dict)
+
+        Example:
+            >>> detector = RecoveryDetector()
+            >>> is_strong, metrics = detector.analyze_recovery_strength(
+            ...     profit_history=[-6.39, -5.20, -4.35, -2.99, 0.05],
+            ...     peak_loss=-6.39
+            ... )
+            >>> print(f"Strong: {is_strong}, Recovery: {metrics['recovery_pct']:.0%}")
+            Strong: True, Recovery: 101%
+        """
+        if not profit_history or len(profit_history) < 2:
+            return False, {"reason": "Insufficient data"}
+
+        current_profit = profit_history[-1]
+
+        # Can't analyze recovery if never was in loss
+        if peak_loss >= 0:
+            return False, {"reason": "No loss to recover from"}
+
+        # 1. Recovery Percentage
+        # From peak_loss (-6.39) to current (0.05) = 6.44 improvement
+        # Recovery % = 6.44 / 6.39 = 100.78%
+        recovery_amount = current_profit - peak_loss
+        recovery_pct = recovery_amount / abs(peak_loss)
+
+        # 2. Recovery Velocity (average over last N samples)
+        recovery_samples = []
+        for i in range(len(profit_history) - 1, 0, -1):
+            if profit_history[i] > peak_loss:
+                recovery_samples.append(profit_history[i])
+            else:
+                break  # Stop when we hit the loss zone
+
+        if len(recovery_samples) < self.min_recovery_samples:
+            return False, {
+                "reason": "Recovery too brief",
+                "samples": len(recovery_samples),
+                "recovery_pct": recovery_pct
+            }
+
+        # Calculate average recovery velocity
+        recovery_deltas = [
+            recovery_samples[i] - recovery_samples[i-1]
+            for i in range(1, len(recovery_samples))
+        ]
+        avg_recovery_vel = np.mean(recovery_deltas) if recovery_deltas else 0.0
+
+        # 3. Recovery Acceleration (is it speeding up?)
+        # Compare first half vs second half velocity
+        if len(recovery_deltas) >= 4:
+            mid = len(recovery_deltas) // 2
+            first_half_vel = np.mean(recovery_deltas[:mid])
+            second_half_vel = np.mean(recovery_deltas[mid:])
+            is_accelerating = second_half_vel > first_half_vel
         else:
-            self._state.win_streak += 1
-            if self._state.win_streak >= self.recovery_win_streak:
-                # Streak criterion met – begin exiting recovery
-                if self._state.in_recovery:
-                    logger.info(
-                        "Recovery win streak (%d) reached – restoring risk",
-                        self._state.win_streak,
-                    )
-                self._state.loss_streak = max(0, self._state.loss_streak - 1)
-                if self._state.loss_streak == 0:
-                    self._state.in_recovery = False
+            is_accelerating = False
 
-    # ------------------------------------------------------------------
-    # Risk sizing
-    # ------------------------------------------------------------------
+        # 4. Recovery Consistency (not erratic)
+        recovery_std = np.std(recovery_deltas) if len(recovery_deltas) > 1 else 0.0
+        is_consistent = recovery_std < 0.5  # Low variance
 
-    def get_recovery_factor(self) -> float:
-        """Return a [0, 1] scale factor representing the severity of the drawdown.
+        # === DECISION LOGIC ===
+        is_strong = False
 
-        Higher value = more severe → applied as a multiplier to reduce risk.
+        # Strong recovery criteria:
+        if (
+            recovery_pct > self.strong_recovery_threshold and  # >80% recovered
+            avg_recovery_vel > self.fast_recovery_velocity and  # Fast recovery
+            len(recovery_samples) >= self.min_recovery_samples  # Sustained
+        ):
+            is_strong = True
 
-        Returns:
-            Factor in [0, 1]; 0 = no losses, 1 = maximum streak.
-        """
-        return min(self._state.loss_streak / _MAX_STREAK_LOSS, 1.0)
+        # OR: Accelerating recovery even if not 80% yet
+        elif (
+            recovery_pct > 0.5 and       # At least 50% recovered
+            is_accelerating and          # Getting faster
+            avg_recovery_vel > 0.03      # Reasonable speed
+        ):
+            is_strong = True
 
-    def get_recommended_risk_multiplier(self) -> float:
-        """Return the recommended position size multiplier.
+        # Metrics
+        metrics = {
+            "recovery_pct": recovery_pct,
+            "recovery_amount": recovery_amount,
+            "avg_recovery_vel": avg_recovery_vel,
+            "recovery_samples": len(recovery_samples),
+            "is_accelerating": is_accelerating,
+            "is_consistent": is_consistent,
+            "recovery_std": recovery_std
+        }
 
-        Anti-revenge logic:
-          - No losses → 1.0 (normal size)
-          - Loss streak → linearly reduced down to max_risk_reduction floor
-          - The multiplier NEVER exceeds 1.0; it only reduces risk.
+        return is_strong, metrics
 
-        Returns:
-            Risk multiplier in [max_risk_reduction, 1.0].
-        """
-        factor = self.get_recovery_factor()
-        # Linear decay from 1.0 to max_risk_reduction
-        multiplier = 1.0 - factor * (1.0 - self.max_risk_reduction)
-        multiplier = max(self.max_risk_reduction, min(1.0, multiplier))
-        logger.debug(
-            "Risk multiplier: %.3f (loss_streak=%d)", multiplier, self._state.loss_streak
-        )
-        return round(multiplier, 3)
-
-    def should_increase_risk(self) -> bool:
-        """Return True only when recovery conditions are fully met.
-
-        Risk increase is only permitted after the win streak threshold has been
-        reached AND the loss streak has been cleared to zero.
-
-        Returns:
-            True when it is safe to return to normal sizing.
-        """
-        return (
-            not self._state.in_recovery
-            and self._state.loss_streak == 0
-            and self._state.win_streak >= self.recovery_win_streak
-        )
-
-    # ------------------------------------------------------------------
-    # Setup quality gate
-    # ------------------------------------------------------------------
-
-    def detect_recovery_setup(
+    def should_extend_grace_period(
         self,
-        df: pl.DataFrame,
-        direction: int,
-    ) -> bool:
-        """Assess if the current chart pattern is high-quality enough during recovery.
-
-        During a loss streak we apply a stricter quality gate to avoid
-        low-probability setups.  This is a simplified heuristic that scores
-        how clean the candle structure is on the most recent bars.
+        profit_history: List[float],
+        peak_loss: float,
+        current_grace_seconds: int,
+        max_grace_seconds: int = 720  # 12 minutes
+    ) -> Tuple[bool, int, str]:
+        """
+        Tentukan apakah grace period harus diperpanjang untuk recovery.
 
         Args:
-            df: OHLCV polars DataFrame.
-            direction: Intended trade direction (+1 long, -1 short).
+            profit_history: Recent profit values
+            peak_loss: Peak loss value
+            current_grace_seconds: Current grace period
+            max_grace_seconds: Maximum allowed grace
 
         Returns:
-            True when the setup meets the recovery quality threshold.
+            (should_extend, new_grace_seconds, reason)
         """
-        if not self._state.in_recovery:
-            return True  # Not in recovery – use normal rules
-
-        if len(df) < 5:
-            return False
-
-        tail = df.tail(5)
-        closes = tail["close"].to_numpy()
-        opens = tail["open"].to_numpy()
-
-        # Count candles aligned with direction
-        aligned = sum(
-            1
-            for o, c in zip(opens, closes)
-            if (direction == 1 and c > o) or (direction == -1 and c < o)
-        )
-        alignment_score = aligned / 5.0
-
-        # Price trending in the right direction over last 5 bars
-        trend_ok = (direction == 1 and closes[-1] > closes[0]) or (
-            direction == -1 and closes[-1] < closes[0]
+        is_strong, metrics = self.analyze_recovery_strength(
+            profit_history, peak_loss
         )
 
-        quality_score = alignment_score * 0.6 + float(trend_ok) * 0.4
-        meets_threshold = quality_score >= self.setup_quality_threshold
+        if not is_strong:
+            return False, current_grace_seconds, "Weak recovery, no extension"
 
-        logger.debug(
-            "Recovery setup score=%.3f threshold=%.3f ok=%s",
-            quality_score, self.setup_quality_threshold, meets_threshold,
+        # Calculate extension based on recovery strength
+        recovery_pct = metrics.get("recovery_pct", 0)
+        recovery_vel = metrics.get("avg_recovery_vel", 0)
+
+        # Strong recovery = extend grace significantly
+        if recovery_pct > 0.8 and recovery_vel > 0.08:
+            extension = 180  # +3 minutes
+            reason = f"Very strong recovery ({recovery_pct:.0%} at {recovery_vel:.4f}$/s)"
+        elif recovery_pct > 0.6 and recovery_vel > 0.05:
+            extension = 120  # +2 minutes
+            reason = f"Strong recovery ({recovery_pct:.0%})"
+        else:
+            extension = 60   # +1 minute
+            reason = f"Moderate recovery ({recovery_pct:.0%})"
+
+        new_grace = min(current_grace_seconds + extension, max_grace_seconds)
+
+        return True, new_grace, reason
+
+    def predict_breakeven_time(
+        self,
+        profit_history: List[float],
+        velocity_history: List[float]
+    ) -> Tuple[int, float]:
+        """
+        Estimasi berapa lama lagi untuk mencapai breakeven.
+
+        Args:
+            profit_history: Recent profit values
+            velocity_history: Recent velocity values
+
+        Returns:
+            (seconds_to_breakeven, confidence)
+        """
+        if not profit_history or not velocity_history:
+            return -1, 0.0
+
+        current_profit = profit_history[-1]
+
+        # Already at breakeven or profit
+        if current_profit >= 0:
+            return 0, 1.0
+
+        # Calculate average velocity during recovery
+        avg_vel = np.mean(velocity_history[-10:])  # Last 10 samples
+
+        # Not recovering (velocity negative or near zero)
+        if avg_vel <= 0.01:
+            return -1, 0.0  # Can't predict
+
+        # Time to breakeven = distance / velocity
+        distance_to_be = abs(current_profit)
+        time_to_be = distance_to_be / avg_vel
+
+        # Confidence based on velocity stability
+        vel_std = np.std(velocity_history[-10:])
+        confidence = max(0, 1.0 - vel_std * 10)  # Lower std = higher confidence
+
+        return int(time_to_be), confidence
+
+    def get_recovery_recommendation(
+        self,
+        profit_history: List[float],
+        peak_loss: float,
+        velocity_history: List[float] = None,
+        current_exit_threshold: float = 0.85
+    ) -> Tuple[str, float, str]:
+        """
+        Rekomendasi lengkap untuk recovering position.
+
+        Returns:
+            (action, adjusted_threshold, reason)
+            action: "HOLD_STRONG", "HOLD_WEAK", "EXIT"
+        """
+        is_strong, metrics = self.analyze_recovery_strength(
+            profit_history, peak_loss, velocity_history
         )
-        return meets_threshold
 
-    @property
-    def state(self) -> RecoveryState:
-        """Read-only view of the current recovery state."""
-        return self._state
+        current_profit = profit_history[-1]
+        recovery_pct = metrics.get("recovery_pct", 0)
+        recovery_vel = metrics.get("avg_recovery_vel", 0)
 
-    def reset(self) -> None:
-        """Reset all state to initial values."""
-        self._state = RecoveryState()
-        logger.info("RecoveryDetector state reset")
+        # HOLD_STRONG: Very strong recovery, raise threshold
+        if is_strong and current_profit >= 0:
+            # Recovered to profit - strong signal
+            adjusted_threshold = min(current_exit_threshold + 0.15, 0.98)
+            action = "HOLD_STRONG"
+            reason = (
+                f"Strong recovery to profit ({recovery_pct:.0%} from ${peak_loss:.2f}, "
+                f"vel={recovery_vel:.4f}$/s)"
+            )
+
+        elif is_strong and current_profit < 0:
+            # Still in loss but strong recovery - give more time
+            adjusted_threshold = min(current_exit_threshold + 0.10, 0.95)
+            action = "HOLD_STRONG"
+            reason = (
+                f"Strong recovery in progress ({recovery_pct:.0%}, "
+                f"vel={recovery_vel:.4f}$/s)"
+            )
+
+        # HOLD_WEAK: Moderate recovery
+        elif recovery_pct > 0.5 and recovery_vel > 0.03:
+            adjusted_threshold = min(current_exit_threshold + 0.05, 0.90)
+            action = "HOLD_WEAK"
+            reason = f"Moderate recovery ({recovery_pct:.0%})"
+
+        # EXIT: Weak or stalled recovery
+        else:
+            adjusted_threshold = max(current_exit_threshold - 0.05, 0.70)
+            action = "EXIT"
+            reason = f"Weak recovery ({recovery_pct:.0%}, vel={recovery_vel:.4f}$/s)"
+
+        return action, adjusted_threshold, reason
+
+
+if __name__ == "__main__":
+    # Test cases
+    detector = RecoveryDetector()
+
+    # Test 1: Strong recovery (Trade #161613468)
+    print("=== Test 1: Strong Recovery from -$6.39 to $0.05 ===")
+    profit_history = [-6.39, -5.67, -5.20, -4.35, -2.99, -0.50, 0.05]
+    peak_loss = -6.39
+
+    is_strong, metrics = detector.analyze_recovery_strength(profit_history, peak_loss)
+    print(f"Is Strong Recovery: {is_strong}")
+    print(f"Recovery %: {metrics['recovery_pct']:.0%}")
+    print(f"Recovery Velocity: {metrics['avg_recovery_vel']:.4f} $/s")
+    print(f"Samples: {metrics['recovery_samples']}")
+    print(f"Accelerating: {metrics['is_accelerating']}\n")
+
+    # Test 2: Recovery recommendation
+    print("=== Test 2: Recovery Recommendation ===")
+    velocity_history = [0.0058, 0.0250, 0.0827, 0.0411, 0.1335]
+
+    action, adj_threshold, reason = detector.get_recovery_recommendation(
+        profit_history, peak_loss, velocity_history, current_exit_threshold=0.90
+    )
+    print(f"Action: {action}")
+    print(f"Adjusted Threshold: {adj_threshold:.0%}")
+    print(f"Reason: {reason}\n")
+
+    # Test 3: Breakeven prediction
+    print("=== Test 3: Breakeven Time Prediction ===")
+    profit_history_loss = [-3.0, -2.5, -2.0, -1.5, -1.0]
+    velocity_history_loss = [0.05, 0.05, 0.05, 0.05, 0.05]
+
+    time_to_be, confidence = detector.predict_breakeven_time(
+        profit_history_loss, velocity_history_loss
+    )
+    print(f"Time to Breakeven: {time_to_be}s ({time_to_be//60}m {time_to_be%60}s)")
+    print(f"Confidence: {confidence:.0%}")
+
+    # Test 4: Weak recovery
+    print("\n=== Test 4: Weak/Stalled Recovery ===")
+    profit_history_weak = [-5.0, -4.8, -4.7, -4.6, -4.5]  # Slow
+    peak_loss_weak = -5.0
+
+    is_strong_weak, metrics_weak = detector.analyze_recovery_strength(
+        profit_history_weak, peak_loss_weak
+    )
+    print(f"Is Strong Recovery: {is_strong_weak}")
+    print(f"Recovery %: {metrics_weak['recovery_pct']:.0%}")
+    print(f"Recovery Velocity: {metrics_weak['avg_recovery_vel']:.4f} $/s")

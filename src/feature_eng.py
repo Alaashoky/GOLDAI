@@ -1,294 +1,727 @@
-"""Feature engineering with 37 features using Polars.
+"""
+Feature Engineering Module - Pure Polars
+=========================================
+Technical indicators and ML features using Polars expressions.
 
-Computes price, technical, SMC, volume, session, regime,
-and momentum features for the ML model.
+NO PANDAS. NO TA-Lib.
+
+Implements:
+- RSI (Wilder's Smoothing)
+- ATR (Average True Range)
+- MACD
+- Bollinger Bands
+- EMA/SMA
+- Volume Profile
+- ML-ready features
 """
 
-from __future__ import annotations
-
-import logging
-from typing import List, Optional
-
-import numpy as np
 import polars as pl
-
-logger = logging.getLogger(__name__)
-
-FEATURE_NAMES: List[str] = [
-    "returns_1", "returns_5", "returns_10",
-    "log_returns_1", "log_returns_5", "log_returns_10",
-    "volatility_5", "volatility_10", "volatility_20",
-    "rsi_14",
-    "macd", "macd_signal", "macd_hist",
-    "bb_upper", "bb_middle", "bb_lower",
-    "atr_14",
-    "adx_14",
-    "stoch_k", "stoch_d", "stoch_signal",
-    "ema_9", "ema_21", "ema_50", "ema_200",
-    "ob_proximity", "fvg_present", "bos_signal",
-    "choch_signal", "liquidity_sweep",
-    "volume_ratio", "volume_momentum", "vwap",
-    "session_id",
-    "hmm_state", "regime_volatility",
-    "momentum_20",
-]
+import numpy as np
+from typing import List, Optional
+from loguru import logger
 
 
-def _ema(series: pl.Series, span: int) -> pl.Series:
-    values = series.to_numpy().astype(float)
-    alpha = 2.0 / (span + 1)
-    result = np.empty_like(values)
-    result[0] = values[0]
-    for i in range(1, len(values)):
-        result[i] = alpha * values[i] + (1 - alpha) * result[i - 1]
-    return pl.Series(name=series.name, values=result)
-
-
-def _rsi(close: pl.Series, period: int = 14) -> pl.Series:
-    values = close.to_numpy().astype(float)
-    deltas = np.diff(values, prepend=values[0])
-    gains = np.where(deltas > 0, deltas, 0.0)
-    losses = np.where(deltas < 0, -deltas, 0.0)
-    avg_gain = np.zeros_like(values)
-    avg_loss = np.zeros_like(values)
-    avg_gain[period] = np.mean(gains[1:period + 1])
-    avg_loss[period] = np.mean(losses[1:period + 1])
-    for i in range(period + 1, len(values)):
-        avg_gain[i] = (avg_gain[i - 1] * (period - 1) + gains[i]) / period
-        avg_loss[i] = (avg_loss[i - 1] * (period - 1) + losses[i]) / period
-    rs = np.where(avg_loss != 0, avg_gain / avg_loss, 100.0)
-    rsi = 100.0 - (100.0 / (1.0 + rs))
-    rsi[:period] = 50.0
-    return pl.Series(name="rsi_14", values=rsi)
-
-
-def _atr(high: pl.Series, low: pl.Series, close: pl.Series, period: int = 14) -> pl.Series:
-    h = high.to_numpy().astype(float)
-    l = low.to_numpy().astype(float)
-    c = close.to_numpy().astype(float)
-    tr = np.maximum(h - l, np.maximum(np.abs(h - np.roll(c, 1)), np.abs(l - np.roll(c, 1))))
-    tr[0] = h[0] - l[0]
-    atr = np.zeros_like(tr)
-    atr[period - 1] = np.mean(tr[:period])
-    for i in range(period, len(tr)):
-        atr[i] = (atr[i - 1] * (period - 1) + tr[i]) / period
-    atr[:period - 1] = atr[period - 1]
-    return pl.Series(name="atr_14", values=atr)
-
-
-def _adx(high: pl.Series, low: pl.Series, close: pl.Series, period: int = 14) -> pl.Series:
-    h = high.to_numpy().astype(float)
-    l = low.to_numpy().astype(float)
-    c = close.to_numpy().astype(float)
-    n = len(h)
-    plus_dm = np.zeros(n)
-    minus_dm = np.zeros(n)
-    tr = np.zeros(n)
-    for i in range(1, n):
-        up = h[i] - h[i - 1]
-        down = l[i - 1] - l[i]
-        plus_dm[i] = up if (up > down and up > 0) else 0.0
-        minus_dm[i] = down if (down > up and down > 0) else 0.0
-        tr[i] = max(h[i] - l[i], abs(h[i] - c[i - 1]), abs(l[i] - c[i - 1]))
-    atr = np.zeros(n)
-    plus_di = np.zeros(n)
-    minus_di = np.zeros(n)
-    dx = np.zeros(n)
-    adx = np.zeros(n)
-    atr[period] = np.sum(tr[1:period + 1])
-    s_plus = np.sum(plus_dm[1:period + 1])
-    s_minus = np.sum(minus_dm[1:period + 1])
-    for i in range(period, n):
-        if i > period:
-            atr[i] = atr[i - 1] - atr[i - 1] / period + tr[i]
-            s_plus = s_plus - s_plus / period + plus_dm[i]
-            s_minus = s_minus - s_minus / period + minus_dm[i]
-        if atr[i] != 0:
-            plus_di[i] = 100 * s_plus / atr[i]
-            minus_di[i] = 100 * s_minus / atr[i]
-        di_sum = plus_di[i] + minus_di[i]
-        dx[i] = 100 * abs(plus_di[i] - minus_di[i]) / di_sum if di_sum != 0 else 0
-    adx[2 * period - 1] = np.mean(dx[period:2 * period])
-    for i in range(2 * period, n):
-        adx[i] = (adx[i - 1] * (period - 1) + dx[i]) / period
-    adx[:2 * period - 1] = adx[2 * period - 1] if 2 * period - 1 < n else 25.0
-    return pl.Series(name="adx_14", values=adx)
-
-
-def _stochastic(
-    high: pl.Series, low: pl.Series, close: pl.Series,
-    k_period: int = 14, d_period: int = 3,
-) -> tuple:
-    h = high.to_numpy().astype(float)
-    l = low.to_numpy().astype(float)
-    c = close.to_numpy().astype(float)
-    n = len(c)
-    k = np.full(n, 50.0)
-    for i in range(k_period - 1, n):
-        hh = np.max(h[i - k_period + 1:i + 1])
-        ll = np.min(l[i - k_period + 1:i + 1])
-        if hh != ll:
-            k[i] = 100 * (c[i] - ll) / (hh - ll)
-    d = np.convolve(k, np.ones(d_period) / d_period, mode="same")
-    signal = np.convolve(d, np.ones(d_period) / d_period, mode="same")
-    return (
-        pl.Series(name="stoch_k", values=k),
-        pl.Series(name="stoch_d", values=d),
-        pl.Series(name="stoch_signal", values=signal),
-    )
-
-
-def _get_session_id(hour: int) -> int:
-    if 22 <= hour or hour < 7:
-        return 0
-    elif 0 <= hour < 9:
-        return 1
-    elif 7 <= hour < 16:
-        return 2
-    else:
-        return 3
-
-
-def compute_features(
-    df: pl.DataFrame,
-    smc_data: Optional[dict] = None,
-    regime_state: int = 1,
-    regime_vol: float = 0.0,
-) -> pl.DataFrame:
-    """Compute all 37 features from OHLCV data.
-
-    Args:
-        df: Polars DataFrame with columns: open, high, low, close, tick_volume, time.
-        smc_data: Optional SMC analysis results.
-        regime_state: HMM regime state (0=trend, 1=range, 2=volatile).
-        regime_vol: Regime volatility measure.
-
-    Returns:
-        pl.DataFrame: DataFrame with 37 feature columns.
+class FeatureEngineer:
     """
-    close = df["close"]
-    high = df["high"]
-    low = df["low"]
-    open_ = df["open"]
-    n = len(df)
-
-    c = close.to_numpy().astype(float)
-    h = high.to_numpy().astype(float)
-    l = low.to_numpy().astype(float)
-
-    features = {}
-
-    for p in [1, 5, 10]:
-        ret = np.zeros(n)
-        ret[p:] = (c[p:] - c[:-p]) / (c[:-p] + 1e-8)
-        features[f"returns_{p}"] = ret
-
-    for p in [1, 5, 10]:
-        lr = np.zeros(n)
-        lr[p:] = np.log(c[p:] / (c[:-p] + 1e-8))
-        features[f"log_returns_{p}"] = lr
-
-    for p in [5, 10, 20]:
-        vol = np.zeros(n)
-        for i in range(p, n):
-            vol[i] = np.std(c[i - p:i])
-        features[f"volatility_{p}"] = vol
-
-    features["rsi_14"] = _rsi(close).to_numpy()
-
-    ema12 = _ema(close, 12).to_numpy()
-    ema26 = _ema(close, 26).to_numpy()
-    macd_line = ema12 - ema26
-    macd_signal = _ema(pl.Series(values=macd_line), 9).to_numpy()
-    features["macd"] = macd_line
-    features["macd_signal"] = macd_signal
-    features["macd_hist"] = macd_line - macd_signal
-
-    bb_mid = _ema(close, 20).to_numpy()
-    bb_std = np.zeros(n)
-    for i in range(20, n):
-        bb_std[i] = np.std(c[i - 20:i])
-    bb_std[:20] = bb_std[20] if n > 20 else 1.0
-    features["bb_upper"] = bb_mid + 2 * bb_std
-    features["bb_middle"] = bb_mid
-    features["bb_lower"] = bb_mid - 2 * bb_std
-
-    features["atr_14"] = _atr(high, low, close).to_numpy()
-    features["adx_14"] = _adx(high, low, close).to_numpy()
-
-    sk, sd, ss = _stochastic(high, low, close)
-    features["stoch_k"] = sk.to_numpy()
-    features["stoch_d"] = sd.to_numpy()
-    features["stoch_signal"] = ss.to_numpy()
-
-    for span in [9, 21, 50, 200]:
-        features[f"ema_{span}"] = _ema(close, span).to_numpy()
-
-    smc = smc_data or {}
-    features["ob_proximity"] = np.full(n, smc.get("ob_proximity", 0.0))
-    features["fvg_present"] = np.full(n, float(smc.get("fvg_present", 0)))
-    features["bos_signal"] = np.full(n, float(smc.get("bos_signal", 0)))
-    features["choch_signal"] = np.full(n, float(smc.get("choch_signal", 0)))
-    features["liquidity_sweep"] = np.full(n, float(smc.get("liquidity_sweep", 0)))
-
-    vol_arr = df["tick_volume"].to_numpy().astype(float) if "tick_volume" in df.columns else np.ones(n)
-    vol_mean = np.mean(vol_arr[-20:]) if n >= 20 else np.mean(vol_arr) + 1e-8
-    features["volume_ratio"] = vol_arr / (vol_mean + 1e-8)
-    mom = np.zeros(n)
-    for i in range(5, n):
-        mom[i] = vol_arr[i] / (np.mean(vol_arr[i - 5:i]) + 1e-8)
-    features["volume_momentum"] = mom
-
-    cum_vol = np.cumsum(vol_arr)
-    cum_vp = np.cumsum(vol_arr * c)
-    features["vwap"] = np.where(cum_vol != 0, cum_vp / cum_vol, c)
-
-    if "time" in df.columns:
-        times = df["time"].to_list()
-        session_ids = np.array([_get_session_id(getattr(t, "hour", 12)) for t in times], dtype=float)
-    else:
-        session_ids = np.full(n, 2.0)
-    features["session_id"] = session_ids
-
-    features["hmm_state"] = np.full(n, float(regime_state))
-    features["regime_volatility"] = np.full(n, regime_vol)
-
-    mom20 = np.zeros(n)
-    if n >= 20:
-        mom20[20:] = c[20:] - c[:-20]
-    features["momentum_20"] = mom20
-
-    result = pl.DataFrame({name: features[name] for name in FEATURE_NAMES})
-    result = result.fill_nan(0.0).fill_null(0.0)
-
-    logger.debug("Computed %d features for %d rows", len(FEATURE_NAMES), n)
-    return result
-
-
-def create_labels(
-    df: pl.DataFrame,
-    forward_bars: int = 10,
-    threshold: float = 0.003,
-) -> np.ndarray:
-    """Create training labels based on forward returns.
-
-    Args:
-        df: DataFrame with close prices.
-        forward_bars: Bars to look ahead.
-        threshold: Return threshold for BUY/SELL.
-
-    Returns:
-        np.ndarray: Labels (0=SELL, 1=HOLD, 2=BUY).
+    Feature engineering using pure Polars expressions.
+    
+    All calculations are vectorized for maximum performance.
+    No loops, no external TA libraries.
     """
-    c = df["close"].to_numpy().astype(float)
-    n = len(c)
-    labels = np.ones(n, dtype=int)
+    
+    def __init__(self):
+        """Initialize the feature engineer."""
+        pass
+    
+    def calculate_all(
+        self,
+        df: pl.DataFrame,
+        include_ml_features: bool = True,
+    ) -> pl.DataFrame:
+        """
+        Calculate all technical indicators and features.
+        
+        Args:
+            df: Polars DataFrame with OHLCV data
+            include_ml_features: Include ML-specific features
+            
+        Returns:
+            DataFrame with all features added
+        """
+        df = self.calculate_rsi(df)
+        df = self.calculate_atr(df)
+        df = self.calculate_macd(df)
+        df = self.calculate_bollinger_bands(df)
+        df = self.calculate_ema_crossover(df)
+        df = self.calculate_volume_features(df)
+        
+        if include_ml_features:
+            df = self.calculate_ml_features(df)
+        
+        return df
+    
+    def calculate_rsi(
+        self,
+        df: pl.DataFrame,
+        period: int = 14,
+        column: str = "close",
+    ) -> pl.DataFrame:
+        """
+        Calculate RSI using Wilder's Smoothing.
+        
+        Wilder's Smoothing uses alpha = 1/n for ewm_mean.
+        
+        RSI = 100 - (100 / (1 + RS))
+        RS = Average Gain / Average Loss
+        
+        Args:
+            df: DataFrame with price data
+            period: RSI period (default 14)
+            column: Price column to use
+            
+        Returns:
+            DataFrame with RSI column added
+        """
+        # Wilder's smoothing alpha
+        alpha = 1.0 / period
+        
+        df = df.with_columns([
+            # Calculate price changes
+            pl.col(column).diff().alias("_delta"),
+        ])
+        
+        df = df.with_columns([
+            # Separate gains (positive changes) and losses (negative changes)
+            pl.when(pl.col("_delta") > 0)
+                .then(pl.col("_delta"))
+                .otherwise(0.0)
+                .alias("_gains"),
+            
+            pl.when(pl.col("_delta") < 0)
+                .then(-pl.col("_delta"))
+                .otherwise(0.0)
+                .alias("_losses"),
+        ])
+        
+        df = df.with_columns([
+            # Apply Wilder's smoothing (EWM with alpha=1/period, adjust=False)
+            pl.col("_gains")
+                .ewm_mean(alpha=alpha, adjust=False, min_periods=period)
+                .alias("_avg_gain"),
+            
+            pl.col("_losses")
+                .ewm_mean(alpha=alpha, adjust=False, min_periods=period)
+                .alias("_avg_loss"),
+        ])
+        
+        df = df.with_columns([
+            # Calculate RSI
+            pl.when(pl.col("_avg_loss") == 0)
+                .then(100.0)
+                .otherwise(
+                    100.0 - (100.0 / (1.0 + pl.col("_avg_gain") / pl.col("_avg_loss")))
+                )
+                .alias("rsi"),
+        ])
+        
+        # Drop temporary columns
+        df = df.drop(["_delta", "_gains", "_losses", "_avg_gain", "_avg_loss"])
+        
+        logger.debug(f"RSI calculated (period={period})")
+        return df
+    
+    def calculate_atr(
+        self,
+        df: pl.DataFrame,
+        period: int = 14,
+    ) -> pl.DataFrame:
+        """
+        Calculate ATR (Average True Range) using Wilder's Smoothing.
+        
+        True Range = max(High - Low, |High - PrevClose|, |Low - PrevClose|)
+        ATR = Wilder's smoothing of True Range
+        
+        Args:
+            df: DataFrame with OHLCV data
+            period: ATR period (default 14)
+            
+        Returns:
+            DataFrame with ATR column added
+        """
+        alpha = 1.0 / period
+        
+        df = df.with_columns([
+            # Previous close for True Range calculation
+            pl.col("close").shift(1).alias("_prev_close"),
+        ])
+        
+        df = df.with_columns([
+            # Three components of True Range
+            (pl.col("high") - pl.col("low")).alias("_hl"),
+            (pl.col("high") - pl.col("_prev_close")).abs().alias("_hpc"),
+            (pl.col("low") - pl.col("_prev_close")).abs().alias("_lpc"),
+        ])
+        
+        df = df.with_columns([
+            # True Range = maximum of three components
+            pl.max_horizontal("_hl", "_hpc", "_lpc").alias("_tr"),
+        ])
+        
+        df = df.with_columns([
+            # Apply Wilder's smoothing to get ATR
+            pl.col("_tr")
+                .ewm_mean(alpha=alpha, adjust=False, min_periods=period)
+                .alias("atr"),
+        ])
+        
+        # Calculate ATR percentage (ATR / Close)
+        df = df.with_columns([
+            (pl.col("atr") / pl.col("close") * 100).alias("atr_percent"),
+        ])
+        
+        # Drop temporary columns
+        df = df.drop(["_prev_close", "_hl", "_hpc", "_lpc", "_tr"])
+        
+        logger.debug(f"ATR calculated (period={period})")
+        return df
+    
+    def calculate_macd(
+        self,
+        df: pl.DataFrame,
+        fast_period: int = 12,
+        slow_period: int = 26,
+        signal_period: int = 9,
+        column: str = "close",
+    ) -> pl.DataFrame:
+        """
+        Calculate MACD (Moving Average Convergence Divergence).
+        
+        MACD Line = EMA(fast) - EMA(slow)
+        Signal Line = EMA(MACD Line)
+        Histogram = MACD Line - Signal Line
+        
+        Args:
+            df: DataFrame with price data
+            fast_period: Fast EMA period (default 12)
+            slow_period: Slow EMA period (default 26)
+            signal_period: Signal line period (default 9)
+            column: Price column to use
+            
+        Returns:
+            DataFrame with MACD columns added
+        """
+        df = df.with_columns([
+            # Calculate EMAs
+            pl.col(column)
+                .ewm_mean(span=fast_period, adjust=False)
+                .alias("_ema_fast"),
+            pl.col(column)
+                .ewm_mean(span=slow_period, adjust=False)
+                .alias("_ema_slow"),
+        ])
+        
+        df = df.with_columns([
+            # MACD line
+            (pl.col("_ema_fast") - pl.col("_ema_slow")).alias("macd"),
+        ])
+        
+        df = df.with_columns([
+            # Signal line
+            pl.col("macd")
+                .ewm_mean(span=signal_period, adjust=False)
+                .alias("macd_signal"),
+        ])
+        
+        df = df.with_columns([
+            # Histogram
+            (pl.col("macd") - pl.col("macd_signal")).alias("macd_histogram"),
+        ])
+        
+        # Drop temporary columns
+        df = df.drop(["_ema_fast", "_ema_slow"])
+        
+        logger.debug(f"MACD calculated ({fast_period}/{slow_period}/{signal_period})")
+        return df
+    
+    def calculate_bollinger_bands(
+        self,
+        df: pl.DataFrame,
+        period: int = 20,
+        std_dev: float = 2.0,
+        column: str = "close",
+    ) -> pl.DataFrame:
+        """
+        Calculate Bollinger Bands.
+        
+        Middle Band = SMA(period)
+        Upper Band = Middle + (std_dev * StdDev)
+        Lower Band = Middle - (std_dev * StdDev)
+        
+        Args:
+            df: DataFrame with price data
+            period: SMA period (default 20)
+            std_dev: Standard deviation multiplier (default 2.0)
+            column: Price column to use
+            
+        Returns:
+            DataFrame with Bollinger Band columns added
+        """
+        df = df.with_columns([
+            # Middle band (SMA)
+            pl.col(column)
+                .rolling_mean(window_size=period)
+                .alias("bb_middle"),
+            
+            # Rolling standard deviation
+            pl.col(column)
+                .rolling_std(window_size=period)
+                .alias("_bb_std"),
+        ])
+        
+        df = df.with_columns([
+            # Upper and lower bands
+            (pl.col("bb_middle") + std_dev * pl.col("_bb_std")).alias("bb_upper"),
+            (pl.col("bb_middle") - std_dev * pl.col("_bb_std")).alias("bb_lower"),
+        ])
+        
+        df = df.with_columns([
+            # Bollinger Band Width (volatility indicator)
+            ((pl.col("bb_upper") - pl.col("bb_lower")) / pl.col("bb_middle"))
+                .alias("bb_width"),
+            
+            # %B (position within bands, 0-1 normally)
+            ((pl.col(column) - pl.col("bb_lower")) / 
+             (pl.col("bb_upper") - pl.col("bb_lower")))
+                .alias("bb_percent_b"),
+        ])
+        
+        # Drop temporary columns
+        df = df.drop(["_bb_std"])
+        
+        logger.debug(f"Bollinger Bands calculated (period={period}, std={std_dev})")
+        return df
+    
+    def calculate_ema_crossover(
+        self,
+        df: pl.DataFrame,
+        fast_period: int = 9,
+        slow_period: int = 21,
+        column: str = "close",
+    ) -> pl.DataFrame:
+        """
+        Calculate EMA crossover signals.
+        
+        Args:
+            df: DataFrame with price data
+            fast_period: Fast EMA period
+            slow_period: Slow EMA period
+            column: Price column
+            
+        Returns:
+            DataFrame with EMA and crossover columns
+        """
+        df = df.with_columns([
+            pl.col(column)
+                .ewm_mean(span=fast_period, adjust=False)
+                .alias(f"ema_{fast_period}"),
+            pl.col(column)
+                .ewm_mean(span=slow_period, adjust=False)
+                .alias(f"ema_{slow_period}"),
+        ])
+        
+        # EMA crossover detection
+        df = df.with_columns([
+            (pl.col(f"ema_{fast_period}") > pl.col(f"ema_{slow_period}"))
+                .alias("_ema_above"),
+        ])
+        
+        df = df.with_columns([
+            pl.col("_ema_above").shift(1).alias("_ema_above_prev"),
+        ])
+        
+        df = df.with_columns([
+            # Bullish crossover: fast crosses above slow
+            (pl.col("_ema_above") & ~pl.col("_ema_above_prev").fill_null(False))
+                .cast(pl.Int8)
+                .alias("ema_cross_bull"),
+            
+            # Bearish crossover: fast crosses below slow
+            (~pl.col("_ema_above") & pl.col("_ema_above_prev").fill_null(False))
+                .cast(pl.Int8)
+                .alias("ema_cross_bear"),
+        ])
+        
+        # Drop temporary columns
+        df = df.drop(["_ema_above", "_ema_above_prev"])
+        
+        logger.debug(f"EMA crossover calculated ({fast_period}/{slow_period})")
+        return df
+    
+    def calculate_volume_features(
+        self,
+        df: pl.DataFrame,
+        period: int = 20,
+    ) -> pl.DataFrame:
+        """
+        Calculate volume-based features.
+        
+        Args:
+            df: DataFrame with volume data
+            period: Period for volume analysis
+            
+        Returns:
+            DataFrame with volume features
+        """
+        if "volume" not in df.columns:
+            logger.warning("Volume column not found, skipping volume features")
+            return df
+        
+        df = df.with_columns([
+            # Volume SMA
+            pl.col("volume")
+                .rolling_mean(window_size=period)
+                .alias("volume_sma"),
+        ])
+        
+        df = df.with_columns([
+            # Volume ratio (current / average)
+            (pl.col("volume") / pl.col("volume_sma")).alias("volume_ratio"),
+            
+            # Volume trend (increasing or decreasing)
+            (pl.col("volume") > pl.col("volume").shift(1))
+                .cast(pl.Int8)
+                .alias("volume_increasing"),
+        ])
+        
+        # High volume bars (> 1.5x average)
+        df = df.with_columns([
+            (pl.col("volume_ratio") > 1.5)
+                .cast(pl.Int8)
+                .alias("high_volume"),
+        ])
 
-    for i in range(n - forward_bars):
-        ret = (c[i + forward_bars] - c[i]) / (c[i] + 1e-8)
-        if ret > threshold:
-            labels[i] = 2
-        elif ret < -threshold:
-            labels[i] = 0
+        # === ADVANCED: Order Flow Imbalance (Pseudo-OFI) ===
+        # Phase 4 - Advanced Exit Strategies
+        # Directional volume classification
+        df = df.with_columns([
+            # Buy volume: close > open (bullish candle)
+            pl.when(pl.col("close") > pl.col("open"))
+                .then(pl.col("volume"))
+                .otherwise(0)
+                .alias("buy_volume"),
 
-    return labels
+            # Sell volume: close < open (bearish candle)
+            pl.when(pl.col("close") < pl.col("open"))
+                .then(pl.col("volume"))
+                .otherwise(0)
+                .alias("sell_volume"),
+        ])
+
+        # Pseudo-OFI calculation
+        df = df.with_columns([
+            (
+                (pl.col("buy_volume") - pl.col("sell_volume")) /
+                (pl.col("buy_volume") + pl.col("sell_volume") + 1e-9)
+            )
+            .alias("ofi_pseudo")
+            .fill_nan(0)
+            .fill_null(0)
+        ])
+
+        # OFI trend and divergence
+        df = df.with_columns([
+            # Rolling OFI mean (20 bars)
+            pl.col("ofi_pseudo").rolling_mean(20).alias("ofi_trend"),
+
+            # Rolling OFI std (for normalization)
+            pl.col("ofi_pseudo").rolling_std(20).alias("ofi_std"),
+        ])
+
+        df = df.with_columns([
+            # OFI divergence (current vs trend)
+            (pl.col("ofi_pseudo") - pl.col("ofi_trend"))
+            .alias("ofi_divergence")
+            .fill_nan(0)
+            .fill_null(0)
+        ])
+
+        # Volume momentum (acceleration)
+        df = df.with_columns([
+            # Volume ratio change (1st derivative)
+            (pl.col("volume_ratio") / pl.col("volume_ratio").shift(1) - 1)
+            .alias("volume_momentum")
+            .fill_nan(0)
+            .fill_null(0),
+        ])
+
+        # Volume toxicity metric
+        # Combines: volume acceleration + OFI divergence + spread expansion
+        if "spread" in df.columns:
+            df = df.with_columns([
+                # Toxicity score (0-5+)
+                (
+                    pl.col("volume_momentum").abs() +
+                    pl.col("ofi_divergence").abs() * 2 +
+                    (pl.col("spread") / pl.col("spread").rolling_mean(20) - 1).abs()
+                )
+                .alias("toxicity")
+                .fill_nan(0)
+                .fill_null(0)
+            ])
+        else:
+            # Simplified toxicity without spread
+            df = df.with_columns([
+                (
+                    pl.col("volume_momentum").abs() +
+                    pl.col("ofi_divergence").abs() * 2
+                )
+                .alias("toxicity")
+                .fill_nan(0)
+                .fill_null(0)
+            ])
+
+        logger.debug(f"Volume features calculated (period={period}, includes OFI & toxicity)")
+        return df
+    
+    def calculate_ml_features(
+        self,
+        df: pl.DataFrame,
+    ) -> pl.DataFrame:
+        """
+        Calculate ML-specific features for XGBoost.
+        
+        Includes:
+        - Returns and momentum
+        - Price position features
+        - Volatility features
+        - Lag features
+        - Time-based features
+        
+        Args:
+            df: DataFrame with OHLCV and indicators
+            
+        Returns:
+            DataFrame with ML features
+        """
+        # Returns and momentum
+        df = df.with_columns([
+            # Simple returns
+            (pl.col("close") / pl.col("close").shift(1) - 1).alias("returns_1"),
+            (pl.col("close") / pl.col("close").shift(5) - 1).alias("returns_5"),
+            (pl.col("close") / pl.col("close").shift(20) - 1).alias("returns_20"),
+            
+            # Log returns
+            (pl.col("close") / pl.col("close").shift(1)).log().alias("log_returns"),
+        ])
+        
+        # Price position features
+        df = df.with_columns([
+            # Price position within day's range
+            ((pl.col("close") - pl.col("low")) / 
+             (pl.col("high") - pl.col("low")))
+                .alias("price_position"),
+            
+            # Distance from SMA
+            pl.col("close")
+                .rolling_mean(window_size=20)
+                .alias("_sma_20"),
+        ])
+        
+        df = df.with_columns([
+            (pl.col("close") / pl.col("_sma_20") - 1).alias("dist_from_sma_20"),
+        ])
+        
+        # Volatility features
+        df = df.with_columns([
+            # Realized volatility (rolling std of returns)
+            pl.col("log_returns")
+                .rolling_std(window_size=20)
+                .alias("volatility_20"),
+            
+            # Normalized range
+            ((pl.col("high") - pl.col("low")) / pl.col("close"))
+                .alias("normalized_range"),
+            
+            # Average normalized range
+            ((pl.col("high") - pl.col("low")) / pl.col("close"))
+                .rolling_mean(window_size=14)
+                .alias("avg_normalized_range"),
+        ])
+        
+        # Lag features
+        df = df.with_columns([
+            pl.col("close").shift(1).alias("close_lag_1"),
+            pl.col("close").shift(2).alias("close_lag_2"),
+            pl.col("close").shift(3).alias("close_lag_3"),
+            pl.col("close").shift(5).alias("close_lag_5"),
+        ])
+        
+        # Trend features
+        df = df.with_columns([
+            # Higher high / lower low sequences
+            (pl.col("high") > pl.col("high").shift(1))
+                .cast(pl.Int8)
+                .alias("higher_high"),
+            (pl.col("low") < pl.col("low").shift(1))
+                .cast(pl.Int8)
+                .alias("lower_low"),
+        ])
+        
+        # Rolling trend strength
+        df = df.with_columns([
+            pl.col("higher_high")
+                .rolling_sum(window_size=5)
+                .alias("hh_count_5"),
+            pl.col("lower_low")
+                .rolling_sum(window_size=5)
+                .alias("ll_count_5"),
+        ])
+        
+        # Time-based features (if datetime column exists)
+        if "time" in df.columns and df["time"].dtype == pl.Datetime:
+            df = df.with_columns([
+                pl.col("time").dt.hour().alias("hour"),
+                pl.col("time").dt.weekday().alias("weekday"),
+                
+                # Trading session indicators
+                ((pl.col("time").dt.hour() >= 8) & (pl.col("time").dt.hour() < 16))
+                    .cast(pl.Int8)
+                    .alias("london_session"),
+                ((pl.col("time").dt.hour() >= 13) & (pl.col("time").dt.hour() < 21))
+                    .cast(pl.Int8)
+                    .alias("ny_session"),
+            ])
+        
+        # Drop temporary columns
+        df = df.drop(["_sma_20"])
+        
+        logger.debug("ML features calculated")
+        return df
+    
+    def create_target(
+        self,
+        df: pl.DataFrame,
+        lookahead: int = 1,
+        threshold: float = 0.0,
+    ) -> pl.DataFrame:
+        """
+        Create target variable for ML training.
+        
+        Args:
+            df: DataFrame with price data
+            lookahead: Bars to look ahead for target
+            threshold: Minimum return threshold for positive target
+            
+        Returns:
+            DataFrame with target column
+        """
+        df = df.with_columns([
+            # Future close
+            pl.col("close").shift(-lookahead).alias("_future_close"),
+        ])
+        
+        df = df.with_columns([
+            # Binary target: 1 if price goes up, 0 otherwise
+            ((pl.col("_future_close") / pl.col("close") - 1) > threshold)
+                .cast(pl.Int32)
+                .alias("target"),
+            
+            # Return target (for regression)
+            (pl.col("_future_close") / pl.col("close") - 1)
+                .alias("target_return"),
+        ])
+        
+        # Drop temporary columns
+        df = df.drop(["_future_close"])
+        
+        logger.debug(f"Target created (lookahead={lookahead}, threshold={threshold})")
+        return df
+    
+    def get_feature_columns(self, df: pl.DataFrame) -> List[str]:
+        """
+        Get list of feature columns for ML training.
+        
+        Args:
+            df: DataFrame with all features
+            
+        Returns:
+            List of feature column names
+        """
+        # Exclude non-feature columns
+        exclude_cols = {
+            "time", "open", "high", "low", "close", "volume",
+            "spread", "real_volume", "target", "target_return",
+            # SMC columns that are signals, not features
+            "swing_high_level", "swing_low_level",
+            "fvg_top", "fvg_bottom", "fvg_mid",
+            "ob_top", "ob_bottom",
+            "bos_level", "choch_level",
+            "bsl_level", "ssl_level",
+            "last_swing_high", "last_swing_low",
+        }
+        
+        feature_cols = [
+            col for col in df.columns
+            if col not in exclude_cols
+            and not col.startswith("_")  # Temporary columns
+        ]
+        
+        return feature_cols
+
+
+def get_default_feature_engineer() -> FeatureEngineer:
+    """Get default configured feature engineer."""
+    return FeatureEngineer()
+
+
+if __name__ == "__main__":
+    # Test feature engineering with synthetic data
+    import numpy as np
+    from datetime import datetime, timedelta
+    
+    # Create synthetic OHLCV data
+    np.random.seed(42)
+    n = 500
+    
+    base_price = 2000.0
+    returns = np.random.randn(n) * 0.002
+    prices = base_price * np.exp(np.cumsum(returns))
+    
+    df = pl.DataFrame({
+        "time": [datetime.now() - timedelta(minutes=15*i) for i in range(n-1, -1, -1)],
+        "open": prices,
+        "high": prices * (1 + np.abs(np.random.randn(n)) * 0.001),
+        "low": prices * (1 - np.abs(np.random.randn(n)) * 0.001),
+        "close": prices * (1 + np.random.randn(n) * 0.0005),
+        "volume": np.random.randint(1000, 10000, n),
+    })
+    
+    # Initialize feature engineer
+    fe = FeatureEngineer()
+    
+    # Calculate all features
+    df = fe.calculate_all(df, include_ml_features=True)
+    
+    # Create target
+    df = fe.create_target(df, lookahead=1)
+    
+    # Get feature columns
+    feature_cols = fe.get_feature_columns(df)
+    
+    print("\n=== Feature Engineering Test ===")
+    print(f"Total columns: {len(df.columns)}")
+    print(f"Feature columns: {len(feature_cols)}")
+    print(f"\nFeatures: {feature_cols}")
+    
+    # Show sample with key indicators
+    print("\n=== Sample Data (Last 5 Rows) ===")
+    display_cols = ["time", "close", "rsi", "atr", "macd", "bb_percent_b", "returns_1", "target"]
+    available_cols = [c for c in display_cols if c in df.columns]
+    print(df.select(available_cols).tail(5))
+    
+    # Stats for key indicators
+    print("\n=== Indicator Statistics ===")
+    for col in ["rsi", "atr", "macd", "bb_percent_b"]:
+        if col in df.columns:
+            stats = df[col].describe()
+            print(f"{col}: mean={df[col].mean():.4f}, std={df[col].std():.4f}")

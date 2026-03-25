@@ -1,43 +1,37 @@
-"""GOLDAI - AI-Powered XAUUSD Trading Bot."""
+"""
+Smart Automatic Trading BOT + AI
+================================
+Hybrid AI Forex Trading System for XAUUSD
 
-from src.version import VERSION as __version__
+Tech Stack:
+- Polars (Rust-based DataFrame engine)
+- MetaTrader5 (Broker connection)
+- XGBoost (ML predictions)
+- HMM (Regime detection)
+- Native SMC implementation (FVG, Order Blocks, BOS)
 
-__author__ = "GOLDAI Team"
+Author: Smart Trading Bot Team
+Version: 1.0.0
+"""
+
+__version__ = "1.0.0"
+__author__ = "Smart Trading Bot Team"
+
+from .config import TradingConfig, CapitalMode
+from .mt5_connector import MT5Connector
+from .smc_polars import SMCAnalyzer
+from .feature_eng import FeatureEngineer
+from .regime_detector import MarketRegimeDetector
+from .risk_engine import RiskEngine
+from .ml_model import TradingModel
 
 __all__ = [
-    # Core
-    "config",
-    "utils",
-    "feature_eng",
-    "ml_model",
-    "regime_detector",
-    "risk_engine",
-    "smc_polars",
-    # Connectors & Infrastructure
-    "mt5_connector",
-    "trade_logger",
-    "telegram_notifier",
-    "telegram_commands",
-    "telegram_notifications",
-    "news_agent",
-    # Risk & Position Management
-    "smart_risk_manager",
-    "position_manager",
-    "session_filter",
-    "dynamic_confidence",
-    # Advanced AI Modules
-    "fuzzy_exit_logic",
-    "kalman_filter",
-    "kelly_position_scaler",
-    "m5_confirmation",
-    "macro_connector",
-    "momentum_persistence",
-    "recovery_detector",
-    "risk_metrics",
-    "trajectory_predictor",
-    "profit_momentum_tracker",
-    # Configuration & Training
-    "filter_config",
-    "auto_trainer",
-    "version",
+    "TradingConfig",
+    "CapitalMode",
+    "MT5Connector",
+    "SMCAnalyzer",
+    "FeatureEngineer",
+    "MarketRegimeDetector",
+    "RiskEngine",
+    "TradingModel",
 ]
