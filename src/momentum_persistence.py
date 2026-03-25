@@ -1,341 +1,330 @@
-from __future__ import annotations
-
-import logging
-from dataclasses import dataclass, field
-from typing import Optional
+"""
+Momentum Persistence Detector - Deteksi apakah momentum akan continue atau reverse
+Menggunakan velocity/acceleration history untuk predict persistence
+"""
 
 import numpy as np
-import polars as pl
-
-logger = logging.getLogger(__name__)
-
-_MIN_BARS = 14
-
-
-@dataclass
-class MomentumResult:
-    """Output of the MomentumPersistence analyser.
-
-    Attributes:
-        score: Combined momentum persistence score in [0, 1].
-        adx_strength: ADX value (0–100; >25 = trending).
-        macd_slope: Normalised MACD slope direction in [-1, 1].
-        divergence_detected: True when RSI divergence is present.
-        exhaustion_detected: True when momentum exhaustion is detected.
-        direction: Net momentum direction (+1 bullish, -1 bearish, 0 neutral).
-    """
-
-    score: float
-    adx_strength: float
-    macd_slope: float
-    divergence_detected: bool
-    exhaustion_detected: bool
-    direction: int
+from typing import List, Tuple, Dict
+from loguru import logger
 
 
 class MomentumPersistence:
-    """Detect and score momentum persistence using multiple indicators.
+    """
+    Analisis persistence (kekuatan berkelanjutan) dari momentum trading.
 
-    Combines ADX trend strength, MACD slope, RSI divergence, and volume-based
-    exhaustion signals into a single composite score that represents how likely
-    the current momentum is to continue.
+    Skor tinggi (>0.7) = Momentum kuat, likely continue -> HOLD position
+    Skor rendah (<0.3) = Momentum lemah, likely reverse -> EXIT position
 
-    Args:
-        adx_period: Period for ADX calculation (default 14).
-        divergence_lookback: Bars to look back for divergence (default 10).
+    Features analyzed:
+    1. Velocity trend consistency (all positive/negative)
+    2. Velocity increasing/decreasing pattern
+    3. Acceleration stability (low variance = stable momentum)
+    4. Momentum duration (how long momentum has persisted)
     """
 
-    def __init__(
-        self,
-        adx_period: int = 14,
-        divergence_lookback: int = 10,
-    ) -> None:
-        self.adx_period = adx_period
-        self.divergence_lookback = divergence_lookback
-
-    # ------------------------------------------------------------------
-    # RSI divergence
-    # ------------------------------------------------------------------
-
-    def calculate_rsi_divergence(
-        self,
-        prices: np.ndarray,
-        rsi_values: np.ndarray,
-    ) -> bool:
-        """Detect regular RSI divergence (price vs RSI extremes disagree).
-
-        Bullish divergence: lower price low but higher RSI low.
-        Bearish divergence: higher price high but lower RSI high.
-
-        Args:
-            prices: Array of close prices.
-            rsi_values: Corresponding RSI values (same length).
-
-        Returns:
-            True when any divergence is detected in the lookback window.
+    def __init__(self, lookback_periods: int = 5):
         """
-        lb = self.divergence_lookback
-        if len(prices) < lb + 2 or len(rsi_values) < lb + 2:
-            return False
+        Args:
+            lookback_periods: Number of recent samples to analyze (default: 5 = 30 seconds)
+        """
+        self.lookback = lookback_periods
+        self.high_threshold = 0.7  # Persistence > 0.7 = strong, HOLD
+        self.low_threshold = 0.3   # Persistence < 0.3 = weak, EXIT
 
-        p = np.asarray(prices[-lb:], dtype=float)
-        r = np.asarray(rsi_values[-lb:], dtype=float)
-
-        # Valid RSI mask (non-nan)
-        valid = ~np.isnan(r)
-        if valid.sum() < 4:
-            return False
-
-        p_valid = p[valid]
-        r_valid = r[valid]
-
-        # Bearish divergence: price higher high but RSI lower high
-        price_higher = p_valid[-1] > p_valid[0]
-        rsi_lower = r_valid[-1] < r_valid[0]
-        bearish_div = price_higher and rsi_lower
-
-        # Bullish divergence: price lower low but RSI higher low
-        price_lower = p_valid[-1] < p_valid[0]
-        rsi_higher = r_valid[-1] > r_valid[0]
-        bullish_div = price_lower and rsi_higher
-
-        result = bearish_div or bullish_div
-        if result:
-            logger.debug("RSI divergence detected (bearish=%s bullish=%s)",
-                         bearish_div, bullish_div)
-        return result
-
-    # ------------------------------------------------------------------
-    # MACD slope
-    # ------------------------------------------------------------------
-
-    def calculate_macd_slope(
+    def calculate_persistence_score(
         self,
-        macd_line: np.ndarray,
-        signal_line: np.ndarray,
+        velocity_history: List[float],
+        acceleration_history: List[float],
+        profit_history: List[float] = None
     ) -> float:
-        """Compute normalised MACD momentum direction.
+        """
+        Hitung momentum persistence score (0-1).
 
         Args:
-            macd_line: MACD histogram line values.
-            signal_line: MACD signal line values.
+            velocity_history: Recent velocity values ($/second)
+            acceleration_history: Recent acceleration values ($/second²)
+            profit_history: Recent profit values (optional, for trend analysis)
 
         Returns:
-            Score in [-1, 1]; positive = bullish momentum.
+            Persistence score 0.0-1.0
+            - 1.0 = Very persistent (strong momentum, HOLD)
+            - 0.5 = Neutral
+            - 0.0 = Reversing (EXIT)
+
+        Example:
+            >>> persistence = MomentumPersistence()
+            >>> score = persistence.calculate_persistence_score(
+            ...     velocity_history=[0.08, 0.09, 0.10, 0.12, 0.13],  # Increasing!
+            ...     acceleration_history=[0.001, 0.001, 0.001, 0.001, 0.001]  # Stable
+            ... )
+            >>> print(f"Persistence: {score:.2f}")  # Should be high (~0.9)
         """
-        if len(macd_line) < 3:
-            return 0.0
+        if len(velocity_history) < 3 or len(acceleration_history) < 3:
+            return 0.5  # Neutral if insufficient data
 
-        macd = np.asarray(macd_line, dtype=float)
-        signal = np.asarray(signal_line, dtype=float)
+        # Get recent samples
+        recent_vels = velocity_history[-self.lookback:]
+        recent_accels = acceleration_history[-self.lookback:]
 
-        histogram = macd - signal
-        recent = histogram[-3:]
-        valid = recent[~np.isnan(recent)]
-        if len(valid) < 2:
-            return 0.0
+        score = 0.0
 
-        slope = float(np.polyfit(range(len(valid)), valid, 1)[0])
+        # === COMPONENT 1: Velocity Direction Consistency (40%) ===
+        # All positive or all negative = consistent
+        all_positive = all(v > 0 for v in recent_vels)
+        all_negative = all(v < 0 for v in recent_vels)
 
-        # Normalise using rolling std
-        std = float(np.std(histogram[~np.isnan(histogram)])) or 1.0
-        normalised = np.tanh(slope / std)
-        return round(float(normalised), 4)
-
-    # ------------------------------------------------------------------
-    # ADX
-    # ------------------------------------------------------------------
-
-    def get_adx_strength(
-        self,
-        high: np.ndarray,
-        low: np.ndarray,
-        close: np.ndarray,
-    ) -> float:
-        """Compute ADX trend strength.
-
-        Args:
-            high: High price array.
-            low: Low price array.
-            close: Close price array.
-
-        Returns:
-            ADX value in [0, 100]; higher = stronger trend.
-        """
-        n = self.adx_period
-        if len(close) < n + 1:
-            return 0.0
-
-        high = np.asarray(high, dtype=float)
-        low = np.asarray(low, dtype=float)
-        close = np.asarray(close, dtype=float)
-
-        prev_close = close[:-1]
-        curr_high = high[1:]
-        curr_low = low[1:]
-
-        # True range
-        tr = np.maximum(
-            curr_high - curr_low,
-            np.maximum(
-                np.abs(curr_high - prev_close),
-                np.abs(curr_low - prev_close),
-            ),
-        )
-
-        # Directional movements
-        up_move = curr_high - high[:-1]
-        down_move = low[:-1] - curr_low
-
-        dm_plus = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-        dm_minus = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-
-        # Smooth
-        def _wilder_smooth(arr: np.ndarray, period: int) -> np.ndarray:
-            result = np.empty_like(arr)
-            result[: period - 1] = np.nan
-            result[period - 1] = arr[:period].sum()
-            for i in range(period, len(arr)):
-                result[i] = result[i - 1] - result[i - 1] / period + arr[i]
-            return result
-
-        tr_s = _wilder_smooth(tr, n)
-        dm_plus_s = _wilder_smooth(dm_plus, n)
-        dm_minus_s = _wilder_smooth(dm_minus, n)
-
-        with np.errstate(divide="ignore", invalid="ignore"):
-            di_plus = 100.0 * dm_plus_s / tr_s
-            di_minus = 100.0 * dm_minus_s / tr_s
-            dx = 100.0 * np.abs(di_plus - di_minus) / (di_plus + di_minus + 1e-10)
-
-        adx_arr = _wilder_smooth(np.nan_to_num(dx), n)
-        # Return last valid value
-        valid = adx_arr[~np.isnan(adx_arr)]
-        return float(valid[-1]) if len(valid) else 0.0
-
-    # ------------------------------------------------------------------
-    # Exhaustion detection
-    # ------------------------------------------------------------------
-
-    def detect_exhaustion(
-        self,
-        prices: np.ndarray,
-        volume: np.ndarray,
-    ) -> bool:
-        """Detect momentum exhaustion via price-volume divergence.
-
-        Exhaustion signal: price continuing to new extremes while volume
-        is declining (momentum running out of fuel).
-
-        Args:
-            prices: Recent close prices.
-            volume: Corresponding volume / tick-volume.
-
-        Returns:
-            True when exhaustion is likely.
-        """
-        if len(prices) < 5 or len(volume) < 5:
-            return False
-
-        p = np.asarray(prices[-5:], dtype=float)
-        v = np.asarray(volume[-5:], dtype=float)
-
-        price_slope = float(np.polyfit(range(len(p)), p, 1)[0])
-        vol_slope = float(np.polyfit(range(len(v)), v, 1)[0])
-
-        # Exhaustion: price trending strongly but volume declining
-        price_trending = abs(price_slope) > 0.0
-        volume_declining = vol_slope < 0
-
-        result = price_trending and volume_declining
-        if result:
-            logger.debug("Exhaustion detected: price_slope=%.4f vol_slope=%.4f",
-                         price_slope, vol_slope)
-        return result
-
-    # ------------------------------------------------------------------
-    # Combined score
-    # ------------------------------------------------------------------
-
-    def get_momentum_score(self, df: pl.DataFrame) -> MomentumResult:
-        """Compute combined momentum persistence score from OHLCV DataFrame.
-
-        Args:
-            df: Polars DataFrame with columns: open, high, low, close, volume
-                (or tick_volume).  Minimum ``_MIN_BARS`` rows required.
-
-        Returns:
-            MomentumResult with composite score and component diagnostics.
-        """
-        if len(df) < _MIN_BARS:
-            logger.warning("Insufficient bars for momentum score (%d)", len(df))
-            return MomentumResult(
-                score=0.0,
-                adx_strength=0.0,
-                macd_slope=0.0,
-                divergence_detected=False,
-                exhaustion_detected=False,
-                direction=0,
-            )
-
-        close_arr = df["close"].to_numpy().astype(float)
-        high_arr = df["high"].to_numpy().astype(float)
-        low_arr = df["low"].to_numpy().astype(float)
-        vol_col = "volume" if "volume" in df.columns else "tick_volume"
-        vol_arr = df[vol_col].to_numpy().astype(float) if vol_col in df.columns else np.ones(len(df))
-
-        # RSI via numpy
-        delta = np.diff(close_arr)
-        gain = np.where(delta > 0, delta, 0.0)
-        loss = np.where(delta < 0, -delta, 0.0)
-        avg_gain = np.convolve(gain, np.ones(14) / 14, mode="valid")
-        avg_loss = np.convolve(loss, np.ones(14) / 14, mode="valid")
-        rs = avg_gain / (avg_loss + 1e-10)
-        rsi = 100.0 - 100.0 / (1.0 + rs)
-        # Pad to match close length
-        rsi_full = np.full(len(close_arr), np.nan)
-        rsi_full[14:] = rsi
-
-        # MACD
-        def _ema(arr: np.ndarray, span: int) -> np.ndarray:
-            k = 2.0 / (span + 1)
-            out = np.empty_like(arr)
-            out[0] = arr[0]
-            for i in range(1, len(arr)):
-                out[i] = arr[i] * k + out[i - 1] * (1 - k)
-            return out
-
-        ema12 = _ema(close_arr, 12)
-        ema26 = _ema(close_arr, 26)
-        macd_line = ema12 - ema26
-        signal_line = _ema(macd_line, 9)
-
-        adx = self.get_adx_strength(high_arr, low_arr, close_arr)
-        macd_slope = self.calculate_macd_slope(macd_line, signal_line)
-        divergence = self.calculate_rsi_divergence(close_arr, rsi_full)
-        exhaustion = self.detect_exhaustion(close_arr, vol_arr)
-
-        # ADX normalised contribution: 25 = threshold, 50 = strong
-        adx_norm = min(adx / 50.0, 1.0)
-
-        # Combine: ADX 40%, MACD slope 40%, penalise for exhaustion/divergence
-        base_score = 0.40 * adx_norm + 0.40 * (abs(macd_slope))
-        penalty = 0.15 * float(divergence) + 0.10 * float(exhaustion)
-        score = max(0.0, min(1.0, base_score - penalty + 0.20))  # +0.20 base floor
-
-        # Direction from MACD slope sign
-        if macd_slope > 0.05:
-            direction = 1
-        elif macd_slope < -0.05:
-            direction = -1
+        if all_positive or all_negative:
+            score += 0.4
         else:
-            direction = 0
+            # Mixed signs = weak momentum
+            positive_ratio = sum(1 for v in recent_vels if v > 0) / len(recent_vels)
+            score += abs(positive_ratio - 0.5) * 0.8  # Max 0.4 if all one sign
 
-        return MomentumResult(
-            score=round(score, 4),
-            adx_strength=round(adx, 2),
-            macd_slope=macd_slope,
-            divergence_detected=divergence,
-            exhaustion_detected=exhaustion,
-            direction=direction,
+        # === COMPONENT 2: Velocity Trend (30%) ===
+        # Increasing velocity = strengthening momentum
+        # Decreasing velocity = weakening momentum
+
+        # Check if velocity magnitude is increasing
+        vel_magnitudes = [abs(v) for v in recent_vels]
+        increasing_count = sum(
+            1 for i in range(1, len(vel_magnitudes))
+            if vel_magnitudes[i] > vel_magnitudes[i-1]
         )
+        increasing_ratio = increasing_count / (len(vel_magnitudes) - 1)
+
+        if increasing_ratio > 0.6:  # Mostly increasing
+            score += 0.3
+        elif increasing_ratio > 0.4:  # Mixed
+            score += 0.15
+        # else: decreasing, no points
+
+        # === COMPONENT 3: Acceleration Stability (30%) ===
+        # Low variance = stable momentum (predictable)
+        # High variance = erratic movement (unpredictable)
+        accel_std = np.std(recent_accels)
+
+        if accel_std < 0.001:  # Very stable
+            score += 0.3
+        elif accel_std < 0.003:  # Moderately stable
+            score += 0.2
+        elif accel_std < 0.005:  # Slightly unstable
+            score += 0.1
+        # else: very unstable, no points
+
+        # Normalize to 0-1
+        return min(max(score, 0.0), 1.0)
+
+    def analyze_momentum_quality(
+        self,
+        velocity_history: List[float],
+        acceleration_history: List[float],
+        current_profit: float
+    ) -> Dict[str, any]:
+        """
+        Analisis komprehensif kualitas momentum.
+
+        Returns dict dengan:
+        - persistence_score: Overall score (0-1)
+        - trend: "strengthening", "weakening", "stable", "reversing"
+        - recommendation: "HOLD", "CONSIDER_EXIT", "EXIT"
+        - components: Breakdown of score components
+        """
+        persistence = self.calculate_persistence_score(
+            velocity_history, acceleration_history
+        )
+
+        # Determine trend
+        if len(velocity_history) >= 3:
+            recent_vels = velocity_history[-3:]
+            if all(abs(recent_vels[i]) > abs(recent_vels[i-1]) for i in range(1, len(recent_vels))):
+                trend = "strengthening"
+            elif all(abs(recent_vels[i]) < abs(recent_vels[i-1]) for i in range(1, len(recent_vels))):
+                trend = "weakening"
+            elif len(velocity_history) >= 2 and \
+                 (recent_vels[-1] * recent_vels[-2]) < 0:  # Sign flip
+                trend = "reversing"
+            else:
+                trend = "stable"
+        else:
+            trend = "unknown"
+
+        # Recommendation based on persistence + trend
+        if persistence > self.high_threshold and trend in ["strengthening", "stable"]:
+            recommendation = "HOLD"
+        elif persistence < self.low_threshold or trend == "reversing":
+            recommendation = "EXIT"
+        else:
+            recommendation = "CONSIDER_EXIT"
+
+        # Component breakdown
+        recent_vels = velocity_history[-self.lookback:]
+        recent_accels = acceleration_history[-self.lookback:]
+
+        components = {
+            "direction_consistency": 1.0 if all(v > 0 for v in recent_vels) or all(v < 0 for v in recent_vels) else 0.5,
+            "trend_strength": abs(np.mean(recent_vels)),
+            "acceleration_stability": 1.0 / (1.0 + np.std(recent_accels) * 100),  # Inverse of std
+            "sample_count": len(velocity_history)
+        }
+
+        return {
+            "persistence_score": persistence,
+            "trend": trend,
+            "recommendation": recommendation,
+            "components": components
+        }
+
+    def should_raise_exit_threshold(
+        self,
+        velocity_history: List[float],
+        acceleration_history: List[float],
+        current_profit: float,
+        base_threshold: float = 0.85
+    ) -> Tuple[bool, float, str]:
+        """
+        Tentukan apakah exit threshold harus dinaikkan karena momentum kuat.
+
+        Args:
+            velocity_history: Recent velocity values
+            acceleration_history: Recent acceleration values
+            current_profit: Current profit ($)
+            base_threshold: Base fuzzy exit threshold
+
+        Returns:
+            (should_raise, new_threshold, reason)
+
+        Example:
+            >>> persistence = MomentumPersistence()
+            >>> should_raise, new_threshold, reason = persistence.should_raise_exit_threshold(
+            ...     velocity_history=[0.10, 0.11, 0.12, 0.13, 0.14],  # Strong increasing
+            ...     acceleration_history=[0.001] * 5,  # Stable
+            ...     current_profit=2.0,
+            ...     base_threshold=0.85
+            ... )
+            >>> print(f"Raise: {should_raise}, New: {new_threshold:.0%}")
+            Raise: True, New: 95%
+        """
+        analysis = self.analyze_momentum_quality(
+            velocity_history, acceleration_history, current_profit
+        )
+
+        persistence = analysis["persistence_score"]
+        trend = analysis["trend"]
+
+        should_raise = False
+        new_threshold = base_threshold
+        reason = ""
+
+        # HIGH PERSISTENCE + STRENGTHENING = Raise threshold significantly
+        if persistence > 0.8 and trend == "strengthening":
+            should_raise = True
+            new_threshold = min(base_threshold + 0.10, 0.98)
+            reason = f"Very strong momentum (persistence={persistence:.0%}, {trend})"
+
+        # MODERATE PERSISTENCE + STABLE = Raise threshold slightly
+        elif persistence > 0.7 and trend in ["strengthening", "stable"]:
+            should_raise = True
+            new_threshold = min(base_threshold + 0.05, 0.95)
+            reason = f"Strong momentum (persistence={persistence:.0%}, {trend})"
+
+        # LOW PERSISTENCE or REVERSING = Keep or lower threshold
+        elif persistence < 0.3 or trend == "reversing":
+            should_raise = False
+            new_threshold = max(base_threshold - 0.05, 0.70)
+            reason = f"Weak/reversing momentum (persistence={persistence:.0%}, {trend})"
+
+        else:
+            reason = f"Neutral momentum (persistence={persistence:.0%})"
+
+        return should_raise, new_threshold, reason
+
+    def detect_momentum_reversal(
+        self,
+        velocity_history: List[float],
+        min_samples: int = 3
+    ) -> Tuple[bool, str]:
+        """
+        Deteksi reversal cepat dalam momentum (danger signal).
+
+        Returns:
+            (is_reversing, reason)
+
+        Example momentum reversal patterns:
+        - Velocity sign flip: [+0.05, +0.03, -0.02] -> reversing!
+        - Rapid deceleration: [+0.10, +0.08, +0.03, +0.01] -> reversing!
+        """
+        if len(velocity_history) < min_samples:
+            return False, "Insufficient data"
+
+        recent = velocity_history[-min_samples:]
+
+        # Pattern 1: Sign flip (positive -> negative or vice versa)
+        if len(recent) >= 2:
+            signs = [1 if v > 0 else -1 if v < 0 else 0 for v in recent]
+            if signs[-1] != signs[0] and signs[-1] != 0 and signs[0] != 0:
+                return True, f"Momentum sign flip: {signs[0]} -> {signs[-1]}"
+
+        # Pattern 2: Rapid deceleration (magnitude dropping >50% in 3 samples)
+        if len(recent) >= 3:
+            magnitudes = [abs(v) for v in recent]
+            if magnitudes[0] > 0.05:  # Only if initial velocity significant
+                decel_ratio = magnitudes[-1] / magnitudes[0]
+                if decel_ratio < 0.5:
+                    return True, f"Rapid deceleration: {decel_ratio:.0%} of initial velocity"
+
+        # Pattern 3: Consistent deceleration (all decreasing)
+        if len(recent) >= 3:
+            magnitudes = [abs(v) for v in recent]
+            if all(magnitudes[i] < magnitudes[i-1] for i in range(1, len(magnitudes))):
+                return True, "Consistent deceleration trend"
+
+        return False, "No reversal detected"
+
+
+if __name__ == "__main__":
+    # Test cases
+    persistence = MomentumPersistence()
+
+    # Test 1: Strong persistent momentum (Trade #161613468 at exit)
+    print("=== Test 1: Strong Persistent Momentum ===")
+    vel_history = [0.0827, 0.0411, 0.0273, 0.0433, 0.1335]  # Increasing
+    accel_history = [0.0004, 0.0004, 0.0001, 0.0005, 0.0017]  # Accelerating
+
+    score = persistence.calculate_persistence_score(vel_history, accel_history)
+    print(f"Persistence Score: {score:.2f}")
+
+    analysis = persistence.analyze_momentum_quality(vel_history, accel_history, 0.05)
+    print(f"Trend: {analysis['trend']}")
+    print(f"Recommendation: {analysis['recommendation']}")
+
+    should_raise, new_thresh, reason = persistence.should_raise_exit_threshold(
+        vel_history, accel_history, 0.05, base_threshold=0.90
+    )
+    print(f"Raise Threshold: {should_raise} -> {new_thresh:.0%}")
+    print(f"Reason: {reason}\n")
+
+    # Test 2: Reversing momentum
+    print("=== Test 2: Reversing Momentum ===")
+    vel_history_rev = [0.08, 0.05, 0.02, -0.01, -0.03]  # Sign flip!
+    accel_history_rev = [0.001, 0.0005, 0.0, -0.0005, -0.001]
+
+    score_rev = persistence.calculate_persistence_score(vel_history_rev, accel_history_rev)
+    print(f"Persistence Score: {score_rev:.2f}")
+
+    is_reversing, reason = persistence.detect_momentum_reversal(vel_history_rev)
+    print(f"Reversing: {is_reversing}")
+    print(f"Reason: {reason}\n")
+
+    # Test 3: Stable momentum
+    print("=== Test 3: Stable Momentum ===")
+    vel_history_stable = [0.05, 0.05, 0.05, 0.05, 0.05]
+    accel_history_stable = [0.0, 0.0, 0.0, 0.0, 0.0]
+
+    score_stable = persistence.calculate_persistence_score(vel_history_stable, accel_history_stable)
+    print(f"Persistence Score: {score_stable:.2f}")
+
+    should_raise, new_thresh, reason = persistence.should_raise_exit_threshold(
+        vel_history_stable, accel_history_stable, 3.0, base_threshold=0.85
+    )
+    print(f"Raise Threshold: {should_raise} -> {new_thresh:.0%}")
+    print(f"Reason: {reason}")

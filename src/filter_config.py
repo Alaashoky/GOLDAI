@@ -1,144 +1,145 @@
-from __future__ import annotations
+"""
+Filter Configuration Manager
+=============================
+Load and save entry filter enable/disable states from data/filter_config.json.
 
-import logging
-from dataclasses import dataclass, field
-from typing import Optional
+Usage:
+    from src.filter_config import FilterConfigManager
 
-logger = logging.getLogger(__name__)
+    config = FilterConfigManager()
+    if config.is_enabled("h1_bias"):
+        # Apply H1 bias filter
+        pass
+"""
 
+import json
+from pathlib import Path
+from typing import Dict, Any
+from datetime import datetime
+from zoneinfo import ZoneInfo
+from loguru import logger
 
-@dataclass
-class FilterProfile:
-    """Configuration profile for a specific market regime.
-
-    Attributes:
-        regime: Regime name ('trending', 'ranging', 'volatile').
-        min_confidence: Minimum signal confidence required.
-        min_volatility: Minimum normalised volatility to allow trades.
-        max_spread_pips: Maximum acceptable spread in pips.
-        max_risk_pct: Maximum risk per trade as fraction of balance.
-        min_momentum_score: Minimum momentum persistence score.
-        require_volume_confirmation: Whether volume check is mandatory.
-        max_trades_per_session: Trade count cap for the session.
-    """
-
-    regime: str
-    min_confidence: float
-    min_volatility: float
-    max_spread_pips: float
-    max_risk_pct: float
-    min_momentum_score: float
-    require_volume_confirmation: bool
-    max_trades_per_session: int
+WIB = ZoneInfo("Asia/Jakarta")
 
 
-@dataclass
-class FilterConfig:
-    """Centralised filter configuration for all market regimes.
+class FilterConfigManager:
+    """Manage entry filter enable/disable configuration."""
 
-    Provides per-regime FilterProfile objects and global risk limits.
-    Instantiate once and pass to strategy components.
+    def __init__(self, config_path: str = "data/filter_config.json"):
+        """Initialize filter config manager."""
+        self.config_path = Path(config_path)
+        self.filters: Dict[str, Dict[str, Any]] = {}
+        self.metadata: Dict[str, Any] = {}
+        self.load()
 
-    Attributes:
-        trending_profile: Config when market is trending.
-        ranging_profile: Config when market is ranging / consolidating.
-        volatile_profile: Config during high-volatility / news regimes.
-        global_max_daily_loss_pct: Hard daily loss limit as pct of balance.
-        global_max_open_trades: Maximum simultaneous open positions.
-        session_risk_limits: Per-session risk caps (keys: london, ny, asia).
-        momentum_min_adx: ADX threshold for trend strength filter.
-        momentum_macd_threshold: MACD threshold for momentum filter.
-    """
+    def load(self) -> None:
+        """Load filter config from JSON file."""
+        try:
+            if not self.config_path.exists():
+                logger.warning(f"Filter config not found at {self.config_path}, using defaults (all enabled)")
+                self._init_defaults()
+                return
 
-    # Regime profiles
-    trending_profile: FilterProfile = field(
-        default_factory=lambda: FilterProfile(
-            regime="trending",
-            min_confidence=0.60,
-            min_volatility=0.20,
-            max_spread_pips=3.0,
-            max_risk_pct=0.015,       # 1.5% per trade
-            min_momentum_score=0.40,
-            require_volume_confirmation=False,
-            max_trades_per_session=4,
-        )
-    )
+            with open(self.config_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
 
-    ranging_profile: FilterProfile = field(
-        default_factory=lambda: FilterProfile(
-            regime="ranging",
-            min_confidence=0.70,      # stricter – fewer false signals
-            min_volatility=0.10,
-            max_spread_pips=2.5,
-            max_risk_pct=0.010,       # 1.0% – smaller size in chop
-            min_momentum_score=0.50,
-            require_volume_confirmation=True,
-            max_trades_per_session=2,
-        )
-    )
+            self.filters = data.get("filters", {})
+            self.metadata = data.get("metadata", {})
 
-    volatile_profile: FilterProfile = field(
-        default_factory=lambda: FilterProfile(
-            regime="volatile",
-            min_confidence=0.75,      # highest bar – protect against spikes
-            min_volatility=0.50,
-            max_spread_pips=5.0,      # wider spreads allowed during news
-            max_risk_pct=0.008,       # 0.8% – minimal risk during volatility
-            min_momentum_score=0.55,
-            require_volume_confirmation=True,
-            max_trades_per_session=1,
-        )
-    )
+            enabled_count = sum(1 for f in self.filters.values() if f.get("enabled", True))
+            total_count = len(self.filters)
+            logger.info(f"Filter config loaded: {enabled_count}/{total_count} filters enabled")
 
-    # Global limits
-    global_max_daily_loss_pct: float = 0.03        # 3% daily stop
-    global_max_open_trades: int = 2
+        except Exception as e:
+            logger.error(f"Failed to load filter config: {e}")
+            self._init_defaults()
 
-    # Per-session risk multipliers (applied on top of profile max_risk_pct)
-    session_risk_limits: dict[str, float] = field(
-        default_factory=lambda: {
-            "london": 1.0,   # full risk during London
-            "ny": 1.0,       # full risk during NY
-            "overlap": 1.0,  # London/NY overlap – most liquid
-            "asia": 0.75,    # reduced risk – thinner market
-            "off": 0.50,     # off-hours – minimal risk
-        }
-    )
+    def save(self) -> None:
+        """Save current filter config to JSON file."""
+        try:
+            self.metadata["updated_at"] = datetime.now(WIB).isoformat()
 
-    # Momentum thresholds
-    momentum_min_adx: float = 20.0       # ADX below this = no clear trend
-    momentum_macd_threshold: float = 0.0  # MACD sign flip threshold
+            data = {
+                "filters": self.filters,
+                "metadata": self.metadata
+            }
 
-    def get_profile(self, regime: str) -> FilterProfile:
-        """Return the FilterProfile for the given regime.
+            with open(self.config_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+
+            logger.info(f"Filter config saved to {self.config_path}")
+
+        except Exception as e:
+            logger.error(f"Failed to save filter config: {e}")
+
+    def is_enabled(self, filter_key: str) -> bool:
+        """
+        Check if a filter is enabled.
 
         Args:
-            regime: One of 'trending', 'ranging', 'volatile'.
-                    Unknown regimes fall back to the volatile (strictest) profile.
+            filter_key: Filter key (e.g., "h1_bias", "ml_confidence")
 
         Returns:
-            FilterProfile for the requested regime.
+            True if enabled, False if disabled or not found
         """
-        mapping = {
-            "trending": self.trending_profile,
-            "ranging": self.ranging_profile,
-            "volatile": self.volatile_profile,
-        }
-        profile = mapping.get(regime.lower())
-        if profile is None:
-            logger.warning(
-                "Unknown regime '%s'; using volatile profile (strictest)", regime
-            )
-            return self.volatile_profile
-        return profile
+        if filter_key not in self.filters:
+            # Unknown filter — default to enabled for safety
+            return True
 
-    def get_session_risk_multiplier(self, session: str) -> float:
-        """Return risk multiplier for the given trading session.
+        return self.filters[filter_key].get("enabled", True)
+
+    def set_enabled(self, filter_key: str, enabled: bool) -> None:
+        """
+        Enable or disable a filter.
 
         Args:
-            session: Session name (e.g. 'london', 'ny', 'asia').
-
-        Returns:
-            Risk multiplier in [0, 1]; defaults to 0.5 for unknown sessions.
+            filter_key: Filter key
+            enabled: True to enable, False to disable
         """
-        return self.session_risk_limits.get(session.lower(), 0.5)
+        if filter_key not in self.filters:
+            logger.warning(f"Unknown filter key: {filter_key}")
+            return
+
+        self.filters[filter_key]["enabled"] = enabled
+        logger.info(f"Filter '{filter_key}' {'enabled' if enabled else 'disabled'}")
+
+    def get_all(self) -> Dict[str, Dict[str, Any]]:
+        """Get all filter configurations."""
+        return self.filters
+
+    def update_all(self, new_config: Dict[str, bool]) -> None:
+        """
+        Update multiple filters at once.
+
+        Args:
+            new_config: Dict mapping filter_key -> enabled (bool)
+        """
+        for filter_key, enabled in new_config.items():
+            if filter_key in self.filters:
+                self.filters[filter_key]["enabled"] = enabled
+
+        self.save()
+
+        enabled_count = sum(1 for f in self.filters.values() if f.get("enabled", True))
+        logger.info(f"Filter config updated: {enabled_count}/{len(self.filters)} enabled")
+
+    def _init_defaults(self) -> None:
+        """Initialize default filter config (all enabled)."""
+        self.filters = {
+            "flash_crash_guard": {"enabled": True, "name": "Flash Crash Guard", "description": "Block entries during extreme price movements"},
+            "regime_filter": {"enabled": True, "name": "Regime Filter", "description": "Filter based on HMM regime detection"},
+            "risk_check": {"enabled": True, "name": "Risk Check", "description": "Daily/total loss limits validation"},
+            "session_filter": {"enabled": True, "name": "Session Filter", "description": "Trading session validation"},
+            "spread_check": {"enabled": True, "name": "Spread Check", "description": "Block entries when spread too wide"},
+            "h1_bias": {"enabled": True, "name": "H1 Bias Filter", "description": "Multi-timeframe H1 EMA20 alignment"},
+            "ml_confidence": {"enabled": True, "name": "ML Confidence", "description": "XGBoost confidence threshold"},
+            "signal_combination": {"enabled": True, "name": "Signal Combination", "description": "SMC + ML signal agreement"},
+            "cooldown": {"enabled": True, "name": "Cooldown Period", "description": "Minimum time between trades"},
+            "time_filter": {"enabled": True, "name": "Time Filter", "description": "Block specific hours"},
+            "market_close_guard": {"enabled": True, "name": "Market Close Guard", "description": "Block near market close"}
+        }
+        self.metadata = {
+            "updated_at": datetime.now(WIB).isoformat(),
+            "version": "1.0"
+        }
+        self.save()

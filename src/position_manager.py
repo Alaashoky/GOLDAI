@@ -1,367 +1,735 @@
-"""Position management system for XAUUSD trading.
-
-Handles trailing stops, breakeven moves, partial closes,
-dynamic take-profit calculation, and early exit logic.
+"""
+Smart Position Manager
+======================
+Intelligent position management with:
+- Trailing Stop Loss
+- Profit Protection
+- Market-based Exit Signals
+- Dynamic SL/TP Adjustment
+- Smart Market Close Handler (NEW)
 """
 
-from __future__ import annotations
+import polars as pl
+import numpy as np
+from typing import Optional, Dict, List, Tuple
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+from loguru import logger
 
-import logging
-from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+try:
+    import MetaTrader5 as mt5
+except ImportError:
+    mt5 = None
 
-from src.utils import utc_now
-
-logger = logging.getLogger(__name__)
-
-DIRECTION_BUY  = "BUY"
-DIRECTION_SELL = "SELL"
-
-
-@dataclass
-class PositionInfo:
-    """All information about a single open position.
-
-    Attributes:
-        ticket: Unique position identifier.
-        symbol: Trading instrument.
-        type: "BUY" or "SELL".
-        entry: Entry price.
-        sl: Current stop-loss price.
-        tp: Current take-profit price.
-        lot: Position size in lots.
-        profit: Unrealised P&L in account currency.
-        open_time: UTC datetime when the position was opened.
-        comment: Optional order comment.
-    """
-
-    ticket: int
-    symbol: str
-    type: str
-    entry: float
-    sl: float
-    tp: float
-    lot: float
-    profit: float = 0.0
-    open_time: datetime = field(default_factory=utc_now)
-    comment: str = ""
+# Timezone constants
+WIB = ZoneInfo("Asia/Jakarta")  # GMT+7
+EST = ZoneInfo("America/New_York")  # Market timezone
 
 
 @dataclass
-class ManagementAction:
-    """Describes an action to take on a position.
-
-    Attributes:
-        ticket: Target position ticket.
-        action: One of "MODIFY_SL_TP", "PARTIAL_CLOSE", "CLOSE".
-        new_sl: Updated stop-loss level (for MODIFY_SL_TP).
-        new_tp: Updated take-profit level (for MODIFY_SL_TP).
-        close_lot: Lot size to close (for PARTIAL_CLOSE).
-        reason: Human-readable reason for the action.
-    """
-
+class PositionAction:
+    """Action to take on a position."""
     ticket: int
-    action: str
-    new_sl: float = 0.0
-    new_tp: float = 0.0
-    close_lot: float = 0.0
-    reason: str = ""
+    action: str  # "HOLD", "CLOSE", "TRAIL_SL", "TAKE_PARTIAL"
+    reason: str
+    new_sl: Optional[float] = None
+    new_tp: Optional[float] = None
+    close_percent: float = 100.0  # For partial close
 
 
-class PositionManager:
-    """Manages open position lifecycle: trailing stops, breakeven, and exits.
+@dataclass
+class MarketCloseAnalysis:
+    """Analysis result for market close decision."""
+    near_close: bool
+    near_weekend: bool
+    hours_to_close: float
+    recommendation: str  # "CLOSE_PROFIT", "HOLD_LOSS", "CUT_LOSS_WEEKEND", "NORMAL"
+    reason: str
 
-    Attributes:
-        trailing_atr_multiplier: ATR multiple used for trailing-stop distance.
-        breakeven_buffer_points: Extra points added above entry for breakeven SL.
-        partial_close_fraction: Fraction of the position to close partially.
-        tp_atr_multiplier: ATR multiple used for dynamic take-profit.
+
+class SmartMarketCloseHandler:
+    """
+    Intelligent market close handler.
+
+    Logic:
+    1. Profit + Near Close -> Close to secure profit (jangan sampai hilang TP)
+    2. Loss + Still in range -> Hold, wait for volatility on reopen
+    3. Loss + Weekend approaching -> Consider cut loss (gap risk)
+
+    Market Hours (XAUUSD):
+    - Sunday 5pm EST - Friday 5pm EST (24/5)
+    - Daily close around 5pm EST = 05:00 WIB (next day)
+    - Weekend gap risk on Monday open
     """
 
     def __init__(
         self,
-        trailing_atr_multiplier: float = 1.5,
-        breakeven_buffer_points: float = 5.0,
-        partial_close_fraction: float = 0.5,
-        tp_atr_multiplier: float = 2.5,
-    ) -> None:
-        """Initialise position manager with configurable parameters.
+        daily_close_hour_wib: int = 5,      # 05:00 WIB = 5pm EST (previous day)
+        hours_before_close: float = 2.0,     # Consider "near close" within 2 hours
+        weekend_close_hour_wib: int = 5,     # Friday 5pm EST = Saturday 05:00 WIB
+        min_profit_to_take: float = 10.0,    # Minimum profit $ to take before close
+        max_loss_to_hold: float = 100.0,     # Max loss $ to hold over close
+        weekend_loss_cut_percent: float = 50.0,  # Cut loss if > 50% of SL hit before weekend
+    ):
+        self.daily_close_hour_wib = daily_close_hour_wib
+        self.hours_before_close = hours_before_close
+        self.weekend_close_hour_wib = weekend_close_hour_wib
+        self.min_profit_to_take = min_profit_to_take
+        self.max_loss_to_hold = max_loss_to_hold
+        self.weekend_loss_cut_percent = weekend_loss_cut_percent
 
-        Args:
-            trailing_atr_multiplier: ATR multiplier for trailing stop distance.
-            breakeven_buffer_points: Minimum profit points before moving to breakeven.
-            partial_close_fraction: Fraction of lot closed on partial-close trigger.
-            tp_atr_multiplier: ATR multiplier used when calculating dynamic TP.
+    def analyze(self, profit: float, sl_distance_percent: float = 0.0) -> MarketCloseAnalysis:
         """
-        self.trailing_atr_multiplier = trailing_atr_multiplier
-        self.breakeven_buffer_points = breakeven_buffer_points
-        self.partial_close_fraction = partial_close_fraction
-        self.tp_atr_multiplier = tp_atr_multiplier
-        self._breakeven_moved: Dict[int, bool] = {}
-        self._partially_closed: Dict[int, bool] = {}
-
-    # ------------------------------------------------------------------
-    # Core management methods
-    # ------------------------------------------------------------------
-
-    def update_trailing_stop(
-        self,
-        position: PositionInfo,
-        current_price: float,
-        atr: float,
-    ) -> Optional[float]:
-        """Calculate a new trailing stop price for an open position.
-
-        The trailing stop maintains a fixed ATR-based distance behind the
-        current market price in the direction of the trade.
+        Analyze position status relative to market close.
 
         Args:
-            position: Open position details.
-            current_price: Latest market price (bid for BUY, ask for SELL).
-            atr: Average True Range value for the active timeframe.
+            profit: Current position profit/loss in $
+            sl_distance_percent: How much of SL has been hit (0-100%)
 
         Returns:
-            Optional[float]: New SL price if it improves the current SL,
-                otherwise None (meaning no change is needed).
+            MarketCloseAnalysis with recommendation
         """
-        trail_distance = atr * self.trailing_atr_multiplier
+        now_wib = datetime.now(WIB)
 
-        if position.type == DIRECTION_BUY:
-            new_sl = current_price - trail_distance
-            if new_sl > position.sl:
-                logger.debug(
-                    "Trailing BUY ticket=%d: SL %.2f -> %.2f",
-                    position.ticket, position.sl, new_sl,
-                )
-                return round(new_sl, 2)
-        else:  # SELL
-            new_sl = current_price + trail_distance
-            if new_sl < position.sl or position.sl == 0:
-                logger.debug(
-                    "Trailing SELL ticket=%d: SL %.2f -> %.2f",
-                    position.ticket, position.sl, new_sl,
-                )
-                return round(new_sl, 2)
+        # Check if near daily close (05:00 WIB)
+        hours_to_daily_close = self._hours_until_time(now_wib, self.daily_close_hour_wib)
+        near_daily_close = hours_to_daily_close <= self.hours_before_close
 
-        return None
+        # Check if near weekend (Friday -> Saturday 05:00 WIB)
+        near_weekend, hours_to_weekend = self._check_weekend_proximity(now_wib)
 
-    def move_to_breakeven(
-        self,
-        position: PositionInfo,
-        current_price: float,
-        min_profit_points: float = 20.0,
-    ) -> Optional[float]:
-        """Shift the stop-loss to the entry price once minimum profit is reached.
-
-        The SL is placed ``breakeven_buffer_points`` beyond the entry so the
-        trade cannot close at a loss even if price briefly retraces.
-
-        Args:
-            position: Open position details.
-            current_price: Latest market price.
-            min_profit_points: Minimum distance in price points before moving.
-
-        Returns:
-            Optional[float]: Breakeven SL price if the move should be executed,
-                otherwise None.
-        """
-        if self._breakeven_moved.get(position.ticket):
-            return None
-
-        buffer = self.breakeven_buffer_points
-
-        if position.type == DIRECTION_BUY:
-            profit_points = current_price - position.entry
-            if profit_points >= min_profit_points:
-                be_sl = position.entry + buffer
-                if be_sl > position.sl:
-                    self._breakeven_moved[position.ticket] = True
-                    logger.info("Breakeven BUY ticket=%d: SL -> %.2f", position.ticket, be_sl)
-                    return round(be_sl, 2)
-        else:  # SELL
-            profit_points = position.entry - current_price
-            if profit_points >= min_profit_points:
-                be_sl = position.entry - buffer
-                if be_sl < position.sl or position.sl == 0:
-                    self._breakeven_moved[position.ticket] = True
-                    logger.info("Breakeven SELL ticket=%d: SL -> %.2f", position.ticket, be_sl)
-                    return round(be_sl, 2)
-
-        return None
-
-    def check_partial_close(
-        self,
-        position: PositionInfo,
-        current_price: float,
-        threshold: float = 50.0,
-    ) -> Optional[float]:
-        """Determine whether a partial close should be executed.
-
-        Args:
-            position: Open position details.
-            current_price: Latest market price.
-            threshold: Profit in points required to trigger a partial close.
-
-        Returns:
-            Optional[float]: Lot size to close if a partial close is warranted,
-                otherwise None.
-        """
-        if self._partially_closed.get(position.ticket):
-            return None
-
-        if position.type == DIRECTION_BUY:
-            profit_points = current_price - position.entry
+        # Determine hours to relevant close
+        if near_weekend:
+            hours_to_close = hours_to_weekend
+            near_close = True
         else:
-            profit_points = position.entry - current_price
+            hours_to_close = hours_to_daily_close
+            near_close = near_daily_close
 
-        if profit_points >= threshold:
-            close_lot = round(position.lot * self.partial_close_fraction, 2)
-            close_lot = max(0.01, close_lot)
-            self._partially_closed[position.ticket] = True
-            logger.info(
-                "Partial close ticket=%d: %.2f lots at profit_pts=%.1f",
-                position.ticket, close_lot, profit_points,
-            )
-            return close_lot
+        # Make recommendation
+        recommendation, reason = self._make_recommendation(
+            profit=profit,
+            near_close=near_close,
+            near_weekend=near_weekend,
+            hours_to_close=hours_to_close,
+            sl_distance_percent=sl_distance_percent,
+        )
 
-        return None
+        return MarketCloseAnalysis(
+            near_close=near_close,
+            near_weekend=near_weekend,
+            hours_to_close=hours_to_close,
+            recommendation=recommendation,
+            reason=reason,
+        )
 
-    def monitor_positions(
-        self,
-        positions: List[PositionInfo],
-        current_price: float,
-        atr: float,
-    ) -> List[ManagementAction]:
-        """Evaluate all open positions and generate management actions.
+    def _hours_until_time(self, now: datetime, target_hour: int) -> float:
+        """Calculate hours until target hour today or tomorrow."""
+        target = now.replace(hour=target_hour, minute=0, second=0, microsecond=0)
 
-        Checks trailing stops, breakeven moves, and partial closes for each
-        position and returns a consolidated list of actions to execute.
+        if now >= target:
+            # Target already passed today, calculate for tomorrow
+            target = target + timedelta(days=1)
 
-        Args:
-            positions: All currently open positions.
-            current_price: Latest market price.
-            atr: Average True Range for position sizing reference.
+        delta = target - now
+        return delta.total_seconds() / 3600
+
+    def _check_weekend_proximity(self, now: datetime) -> Tuple[bool, float]:
+        """
+        Check if we're approaching weekend close.
+
+        Weekend close = Saturday 05:00 WIB (Friday 5pm EST)
 
         Returns:
-            List[ManagementAction]: Actions to execute (may be empty).
+            (near_weekend, hours_to_weekend_close)
         """
-        actions: List[ManagementAction] = []
+        weekday = now.weekday()  # 0=Monday, 4=Friday, 5=Saturday, 6=Sunday
 
-        for pos in positions:
-            new_sl: Optional[float] = None
-            new_tp: Optional[float] = None
+        # Calculate hours until Saturday 05:00 WIB
+        if weekday == 5:  # Saturday
+            # Already weekend
+            return False, 0
+        elif weekday == 6:  # Sunday
+            # Market opening soon, not approaching close
+            return False, 0
+        else:
+            # Monday-Friday
+            days_until_saturday = (5 - weekday) % 7
+            if days_until_saturday == 0:
+                days_until_saturday = 7  # Should not happen, but safety
 
-            # Breakeven takes priority over trailing
-            be_sl = self.move_to_breakeven(pos, current_price)
-            if be_sl is not None:
-                new_sl = be_sl
-                new_tp = pos.tp
+            target = now.replace(hour=self.weekend_close_hour_wib, minute=0, second=0, microsecond=0)
+            target = target + timedelta(days=days_until_saturday)
+
+            delta = target - now
+            hours_to_weekend = delta.total_seconds() / 3600
+
+            # Consider "near weekend" if within 30 min of close (Saturday ~04:30 WIB)
+            # Market closes Saturday 05:00 WIB — Friday night trading is OK
+            near_weekend = hours_to_weekend <= 0.5 and weekday == 4  # Friday only
+
+            return near_weekend, hours_to_weekend
+
+    def _make_recommendation(
+        self,
+        profit: float,
+        near_close: bool,
+        near_weekend: bool,
+        hours_to_close: float,
+        sl_distance_percent: float,
+    ) -> Tuple[str, str]:
+        """
+        Make smart recommendation based on conditions.
+
+        Returns:
+            (recommendation, reason)
+        """
+        # Case 1: In profit and near close -> TAKE PROFIT
+        if profit >= self.min_profit_to_take and near_close:
+            urgency = "WEEKEND" if near_weekend else "daily"
+            return (
+                "CLOSE_PROFIT",
+                f"Take profit ${profit:.2f} before {urgency} close ({hours_to_close:.1f}h remaining)"
+            )
+
+        # Case 2: In loss, near weekend, and significant SL hit -> CUT LOSS
+        if profit < 0 and near_weekend:
+            if sl_distance_percent >= self.weekend_loss_cut_percent:
+                return (
+                    "CUT_LOSS_WEEKEND",
+                    f"Cut loss ${profit:.2f} before weekend (SL {sl_distance_percent:.0f}% hit, gap risk)"
+                )
+            elif abs(profit) > self.max_loss_to_hold:
+                return (
+                    "CUT_LOSS_WEEKEND",
+                    f"Cut large loss ${profit:.2f} before weekend (gap risk)"
+                )
             else:
-                trail_sl = self.update_trailing_stop(pos, current_price, atr)
-                if trail_sl is not None:
-                    new_sl = trail_sl
-                    new_tp = pos.tp
-
-            if new_sl is not None:
-                actions.append(
-                    ManagementAction(
-                        ticket=pos.ticket,
-                        action="MODIFY_SL_TP",
-                        new_sl=new_sl,
-                        new_tp=new_tp or pos.tp,
-                        reason="trailing/breakeven",
-                    )
+                return (
+                    "HOLD_LOSS",
+                    f"Hold small loss ${profit:.2f} over weekend (may recover on Monday volatility)"
                 )
 
-            # Partial close
-            close_lot = self.check_partial_close(pos, current_price)
-            if close_lot is not None:
-                actions.append(
-                    ManagementAction(
-                        ticket=pos.ticket,
-                        action="PARTIAL_CLOSE",
-                        close_lot=close_lot,
-                        reason="partial_close_threshold",
-                    )
+        # Case 3: In loss, near daily close but not weekend -> HOLD
+        if profit < 0 and near_close and not near_weekend:
+            if abs(profit) <= self.max_loss_to_hold:
+                return (
+                    "HOLD_LOSS",
+                    f"Hold loss ${profit:.2f} over daily close (may recover tomorrow)"
                 )
+            else:
+                return (
+                    "CUT_LOSS_WEEKEND",  # Reuse for large daily loss
+                    f"Consider cutting large loss ${profit:.2f} before close"
+                )
+
+        # Case 4: Small profit near close -> Consider taking
+        if profit > 0 and profit < self.min_profit_to_take and near_close:
+            if hours_to_close < 0.5:  # Very close to close (30 min)
+                return (
+                    "CLOSE_PROFIT",
+                    f"Take small profit ${profit:.2f} (only {hours_to_close*60:.0f}min to close)"
+                )
+
+        # Default: Normal operation
+        return ("NORMAL", "No market close action needed")
+
+    def get_market_status(self) -> Dict:
+        """Get current market status for logging."""
+        now_wib = datetime.now(WIB)
+        weekday = now_wib.weekday()
+        weekday_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+        near_weekend, hours_to_weekend = self._check_weekend_proximity(now_wib)
+        hours_to_daily = self._hours_until_time(now_wib, self.daily_close_hour_wib)
+
+        return {
+            "time_wib": now_wib.strftime("%H:%M:%S"),
+            "day": weekday_names[weekday],
+            "hours_to_daily_close": hours_to_daily,
+            "hours_to_weekend_close": hours_to_weekend if weekday < 5 else 0,
+            "near_weekend": near_weekend,
+            "market_open": weekday < 5 or (weekday == 6 and now_wib.hour >= 22),  # Sunday 10pm WIB
+        }
+
+
+class SmartPositionManager:
+    """
+    Smart position manager with profit protection.
+
+    Features:
+    - Trailing stop loss (lock in profits)
+    - Breakeven protection
+    - Market condition-based exits
+    - Momentum reversal detection
+    - Regime-based position adjustment
+    - Smart Market Close Handler (take profit before close, hold loss if recoverable)
+    """
+
+    def __init__(
+        self,
+        breakeven_pips: float = 15.0,      # Fallback if ATR unavailable
+        trail_start_pips: float = 25.0,    # Fallback if ATR unavailable
+        trail_step_pips: float = 10.0,     # Fallback if ATR unavailable
+        min_profit_to_protect: float = 50.0,  # Minimum $ profit to protect
+        max_drawdown_from_peak: float = 30.0,  # Max % drawdown from peak profit
+        # ATR-adaptive exit multipliers (#24B: backtest +$373)
+        atr_be_mult: float = 2.0,          # Breakeven = ATR * 2.0
+        atr_trail_start_mult: float = 4.0, # Trail start = ATR * 4.0
+        atr_trail_step_mult: float = 3.0,  # Trail step = ATR * 3.0
+        # Market Close Handler settings
+        enable_market_close_handler: bool = True,
+        min_profit_before_close: float = 10.0,  # Take profit if >= $10 near close
+        max_loss_to_hold: float = 100.0,   # Hold loss up to $100 over close
+    ):
+        self.breakeven_pips = breakeven_pips
+        self.trail_start_pips = trail_start_pips
+        self.trail_step_pips = trail_step_pips
+        self.atr_be_mult = atr_be_mult
+        self.atr_trail_start_mult = atr_trail_start_mult
+        self.atr_trail_step_mult = atr_trail_step_mult
+        self.min_profit_to_protect = min_profit_to_protect
+        self.max_drawdown_from_peak = max_drawdown_from_peak
+
+        # Initialize market close handler
+        self.enable_market_close_handler = enable_market_close_handler
+        self.market_close_handler = SmartMarketCloseHandler(
+            min_profit_to_take=min_profit_before_close,
+            max_loss_to_hold=max_loss_to_hold,
+        )
+
+        # Track peak profit per position
+        self._peak_profits: Dict[int, float] = {}
+        self._entry_times: Dict[int, datetime] = {}
+
+    def analyze_positions(
+        self,
+        positions: pl.DataFrame,
+        df_market: pl.DataFrame,
+        regime_state,
+        ml_prediction,
+        current_price: float,
+    ) -> List[PositionAction]:
+        """
+        Analyze all positions and decide actions.
+
+        Args:
+            positions: DataFrame of open positions
+            df_market: Market data DataFrame with indicators
+            regime_state: Current market regime
+            ml_prediction: Current ML prediction
+            current_price: Current market price
+
+        Returns:
+            List of PositionAction for each position
+        """
+        actions = []
+
+        if len(positions) == 0:
+            return actions
+
+        # Get market analysis
+        market_analysis = self._analyze_market(df_market, regime_state, ml_prediction)
+
+        # Get current ATR for adaptive exit levels (#24B)
+        current_atr = None
+        if "atr" in df_market.columns:
+            atr_val = df_market["atr"].tail(1).item()
+            if atr_val is not None and atr_val > 0:
+                current_atr = atr_val
+
+        # #33B: Get last candle range for impulse detection
+        last_candle_range = None
+        if len(df_market) >= 1:
+            last_row = df_market.tail(1)
+            last_high = last_row["high"].item()
+            last_low = last_row["low"].item()
+            if last_high is not None and last_low is not None:
+                last_candle_range = last_high - last_low
+
+        for row in positions.iter_rows(named=True):
+            action = self._analyze_single_position(
+                row, market_analysis, current_price, current_atr, last_candle_range
+            )
+            if action:
+                actions.append(action)
 
         return actions
 
-    def calculate_dynamic_tp(
+    def _analyze_market(
         self,
-        entry: float,
-        direction: str,
-        atr: float,
-        regime: str = "TRENDING",
-    ) -> float:
-        """Calculate a dynamic take-profit level based on ATR and market regime.
-
-        Trending markets use a larger TP multiplier to capture extended moves,
-        while ranging markets use a tighter TP to lock in profits quickly.
-
-        Args:
-            entry: Position entry price.
-            direction: "BUY" or "SELL".
-            atr: Average True Range value.
-            regime: Market regime label: "TRENDING", "RANGING", or "VOLATILE".
-
-        Returns:
-            float: Calculated take-profit price.
-        """
-        regime_multipliers: Dict[str, float] = {
-            "TRENDING": self.tp_atr_multiplier,
-            "RANGING":  self.tp_atr_multiplier * 0.6,
-            "VOLATILE": self.tp_atr_multiplier * 0.8,
+        df: pl.DataFrame,
+        regime_state,
+        ml_prediction,
+    ) -> Dict:
+        """Analyze current market conditions."""
+        analysis = {
+            "trend": "NEUTRAL",
+            "momentum": "NEUTRAL",
+            "regime": "medium_volatility",
+            "ml_signal": "HOLD",
+            "ml_confidence": 0.5,
+            "should_exit_longs": False,
+            "should_exit_shorts": False,
+            "urgency": 0,  # 0-10 scale
         }
-        multiplier = regime_multipliers.get(regime, self.tp_atr_multiplier)
-        distance = atr * multiplier
 
-        if direction == DIRECTION_BUY:
-            tp = entry + distance
-        else:
-            tp = entry - distance
+        if len(df) < 20:
+            return analysis
 
-        return round(tp, 2)
+        # Get recent data
+        close = df["close"].tail(20).to_numpy()
 
-    def should_exit_early(
+        # Trend analysis (simple MA comparison)
+        ma_fast = np.mean(close[-5:])
+        ma_slow = np.mean(close[-20:])
+
+        if ma_fast > ma_slow * 1.001:
+            analysis["trend"] = "BULLISH"
+        elif ma_fast < ma_slow * 0.999:
+            analysis["trend"] = "BEARISH"
+
+        # Momentum analysis (rate of change)
+        roc = (close[-1] / close[-5] - 1) * 100
+        if roc > 0.3:
+            analysis["momentum"] = "BULLISH"
+        elif roc < -0.3:
+            analysis["momentum"] = "BEARISH"
+
+        # Regime
+        if regime_state:
+            analysis["regime"] = regime_state.regime.value
+
+            # High volatility = be careful
+            if regime_state.regime.value in ["high_volatility", "crisis"]:
+                analysis["urgency"] += 3
+
+        # ML signal
+        if ml_prediction:
+            analysis["ml_signal"] = ml_prediction.signal
+            analysis["ml_confidence"] = ml_prediction.confidence
+
+            # Strong opposite signal = consider exit
+            if ml_prediction.confidence > 0.75:
+                if ml_prediction.signal == "SELL":
+                    analysis["should_exit_longs"] = True
+                    analysis["urgency"] += 2
+                elif ml_prediction.signal == "BUY":
+                    analysis["should_exit_shorts"] = True
+                    analysis["urgency"] += 2
+
+        # RSI analysis (if available)
+        if "rsi" in df.columns:
+            rsi = df["rsi"].tail(1).item()
+            if rsi and rsi > 75:
+                analysis["should_exit_longs"] = True
+                analysis["urgency"] += 2
+            elif rsi and rsi < 25:
+                analysis["should_exit_shorts"] = True
+                analysis["urgency"] += 2
+
+        # Trend reversal detection
+        if analysis["trend"] == "BEARISH" and analysis["momentum"] == "BEARISH":
+            analysis["should_exit_longs"] = True
+            analysis["urgency"] += 3
+        elif analysis["trend"] == "BULLISH" and analysis["momentum"] == "BULLISH":
+            analysis["should_exit_shorts"] = True
+            analysis["urgency"] += 3
+
+        return analysis
+
+    def _analyze_single_position(
         self,
-        position: PositionInfo,
-        smc_signal: str,
-        fuzzy_score: float,
-    ) -> Tuple[bool, str]:
-        """Determine whether to exit a trade ahead of its take-profit.
+        pos: Dict,
+        market: Dict,
+        current_price: float,
+        current_atr: float = None,
+        last_candle_range: float = None,
+    ) -> Optional[PositionAction]:
+        """Analyze a single position and decide action."""
+        ticket = pos["ticket"]
+        pos_type = pos.get("type", 0)  # Can be int (0=BUY, 1=SELL) or str ("BUY"/"SELL")
+        entry_price = pos["price_open"]
+        current_sl = pos.get("sl", 0)
+        current_tp = pos.get("tp", 0)
+        profit = pos.get("profit", 0)
+        volume = pos.get("volume", 0.01)
 
-        Exits early when the SMC signal has reversed against the open position
-        and the fuzzy confidence for that reversal is sufficiently high.
+        # Handle both int (MT5 raw) and string (from DataFrame) type formats
+        is_buy = pos_type in [0, "BUY", mt5.POSITION_TYPE_BUY if mt5 else 0]
 
-        Args:
-            position: Open position details.
-            smc_signal: Current SMC signal direction ("BUY", "SELL", or "HOLD").
-            fuzzy_score: Confidence score of the SMC signal (0.0–1.0).
+        # Calculate pip profit
+        if is_buy:
+            pip_profit = (current_price - entry_price) / 0.1  # Gold pips
+        else:
+            pip_profit = (entry_price - current_price) / 0.1
 
-        Returns:
-            Tuple[bool, str]: (should_exit, reason_string).
-        """
-        opposite = DIRECTION_SELL if position.type == DIRECTION_BUY else DIRECTION_BUY
+        # Track peak profit
+        if ticket not in self._peak_profits:
+            self._peak_profits[ticket] = profit
+        else:
+            self._peak_profits[ticket] = max(self._peak_profits[ticket], profit)
 
-        if smc_signal == opposite and fuzzy_score >= 0.65:
-            reason = f"SMC reversal signal {smc_signal} with confidence {fuzzy_score:.2f}"
-            logger.info("Early exit ticket=%d: %s", position.ticket, reason)
-            return True, reason
+        peak_profit = self._peak_profits[ticket]
 
-        # Also exit when position is underwater and a strong counter-signal is present
-        if position.profit < 0 and fuzzy_score < 0.3 and smc_signal == opposite:
-            reason = "weak confluence with counter-direction SMC"
-            return True, reason
+        # === CLOSE CONDITIONS ===
 
-        return False, ""
+        # 0. SMART MARKET CLOSE HANDLER - Priority check before other conditions
+        if self.enable_market_close_handler:
+            # Calculate SL distance percent (how much of SL has been hit)
+            sl_distance_percent = 0.0
+            if current_sl > 0 and entry_price > 0:
+                max_loss_distance = abs(entry_price - current_sl)
+                if max_loss_distance > 0:
+                    current_loss_distance = abs(current_price - entry_price) if profit < 0 else 0
+                    sl_distance_percent = (current_loss_distance / max_loss_distance) * 100
 
-    def cleanup_closed(self, ticket: int) -> None:
-        """Remove tracking state for a closed position.
+            close_analysis = self.market_close_handler.analyze(
+                profit=profit,
+                sl_distance_percent=sl_distance_percent,
+            )
 
-        Args:
-            ticket: Ticket number of the closed position.
-        """
-        self._breakeven_moved.pop(ticket, None)
-        self._partially_closed.pop(ticket, None)
+            if close_analysis.recommendation == "CLOSE_PROFIT":
+                # Take profit before market close - jangan sampai hilang TP!
+                return PositionAction(
+                    ticket=ticket,
+                    action="CLOSE",
+                    reason=f"Market Close: {close_analysis.reason}",
+                )
+            elif close_analysis.recommendation == "CUT_LOSS_WEEKEND":
+                # Cut loss before weekend to avoid gap risk
+                return PositionAction(
+                    ticket=ticket,
+                    action="CLOSE",
+                    reason=f"Weekend Risk: {close_analysis.reason}",
+                )
+            elif close_analysis.recommendation == "HOLD_LOSS":
+                # Hold loss - might recover on reopen with volatility
+                # Log but don't close, let other conditions potentially trigger
+                logger.debug(f"Market Close Hold: {close_analysis.reason}")
+                # Continue to check other conditions, but this gives context
+
+        # 1. Regime change to dangerous
+        if market["regime"] in ["crisis", "high_volatility"] and profit > self.min_profit_to_protect:
+            return PositionAction(
+                ticket=ticket,
+                action="CLOSE",
+                reason=f"Regime danger ({market['regime']}) - Securing ${profit:.2f} profit",
+            )
+
+        # 2. Strong opposite signal — only exit at substantial profit (v5)
+        # min_profit_to_protect / 2 was too low ($4), now requires 75% of threshold
+        signal_exit_threshold = self.min_profit_to_protect * 0.75
+        if is_buy and market["should_exit_longs"] and profit > signal_exit_threshold:
+            return PositionAction(
+                ticket=ticket,
+                action="CLOSE",
+                reason=f"Bearish signal detected - Securing ${profit:.2f} profit (threshold ${signal_exit_threshold:.0f})",
+            )
+        elif not is_buy and market["should_exit_shorts"] and profit > signal_exit_threshold:
+            return PositionAction(
+                ticket=ticket,
+                action="CLOSE",
+                reason=f"Bullish signal detected - Securing ${profit:.2f} profit (threshold ${signal_exit_threshold:.0f})",
+            )
+
+        # 3. Drawdown from peak profit
+        if peak_profit > self.min_profit_to_protect:
+            drawdown_pct = ((peak_profit - profit) / peak_profit) * 100 if peak_profit > 0 else 0
+            if drawdown_pct > self.max_drawdown_from_peak:
+                return PositionAction(
+                    ticket=ticket,
+                    action="CLOSE",
+                    reason=f"Profit protection: {drawdown_pct:.0f}% drawdown from peak ${peak_profit:.2f}",
+                )
+
+        # 4. High urgency — only exit at substantial profit (v4: raised from $0)
+        if market["urgency"] >= 8 and profit > self.min_profit_to_protect:
+            return PositionAction(
+                ticket=ticket,
+                action="CLOSE",
+                reason=f"High urgency exit (score: {market['urgency']}) - Securing ${profit:.2f}",
+            )
+
+        # === TRAILING STOP CONDITIONS (ATR-adaptive #24B) ===
+
+        # Compute adaptive levels from ATR (fall back to fixed pips if ATR unavailable)
+        if current_atr is not None and current_atr > 0:
+            # ATR is in price terms; convert to pips (1 pip = 0.1 for gold)
+            be_pips = current_atr * self.atr_be_mult / 0.1
+            trail_start = current_atr * self.atr_trail_start_mult / 0.1
+            trail_step = current_atr * self.atr_trail_step_mult / 0.1
+        else:
+            be_pips = self.breakeven_pips
+            trail_start = self.trail_start_pips
+            trail_step = self.trail_step_pips
+
+        # 5. Breakeven protection (#28B: smart BE locks profit at 0.5*ATR instead of fixed $2)
+        if pip_profit >= be_pips and current_sl != 0:
+            be_lock_distance = current_atr * 0.5 if (current_atr is not None and current_atr > 0) else 2.0
+            breakeven_sl = entry_price + (1 if is_buy else -1) * be_lock_distance
+
+            if is_buy and current_sl < breakeven_sl:
+                return PositionAction(
+                    ticket=ticket,
+                    action="TRAIL_SL",
+                    reason=f"Moving SL to breakeven ({pip_profit:.1f}/{be_pips:.0f} pips)",
+                    new_sl=breakeven_sl,
+                )
+            elif not is_buy and current_sl > breakeven_sl:
+                return PositionAction(
+                    ticket=ticket,
+                    action="TRAIL_SL",
+                    reason=f"Moving SL to breakeven ({pip_profit:.1f}/{be_pips:.0f} pips)",
+                    new_sl=breakeven_sl,
+                )
+
+        # 6. Trailing stop (after trail_start pips)
+        # #33B: Impulse detection — tighten trail when candle range > 1.5x ATR
+        if pip_profit >= trail_start:
+            is_impulse = False
+            if last_candle_range is not None and current_atr is not None and current_atr > 0:
+                if last_candle_range > current_atr * 1.5:
+                    is_impulse = True
+
+            active_trail_step = trail_step
+            if is_impulse:
+                active_trail_step = (current_atr * 1.5) / 0.1  # 1.5x ATR in pips
+            trail_distance = active_trail_step * 0.1  # Convert to price
+
+            if is_buy:
+                new_trail_sl = current_price - trail_distance
+                if current_sl < new_trail_sl:
+                    return PositionAction(
+                        ticket=ticket,
+                        action="TRAIL_SL",
+                        reason=f"Trailing SL ({pip_profit:.1f}/{trail_start:.0f} pips)",
+                        new_sl=new_trail_sl,
+                    )
+            else:
+                new_trail_sl = current_price + trail_distance
+                if current_sl > new_trail_sl or current_sl == 0:
+                    return PositionAction(
+                        ticket=ticket,
+                        action="TRAIL_SL",
+                        reason=f"Trailing SL ({pip_profit:.1f}/{trail_start:.0f} pips)",
+                        new_sl=new_trail_sl,
+                    )
+
+        # 7. Default: HOLD
+        return PositionAction(
+            ticket=ticket,
+            action="HOLD",
+            reason=f"Holding position ({pip_profit:.1f} pips, ${profit:.2f})",
+        )
+
+    def execute_actions(self, actions: List[PositionAction]) -> List[Dict]:
+        """Execute position actions via MT5."""
+        results = []
+
+        if mt5 is None:
+            logger.error("MT5 not available")
+            return results
+
+        for action in actions:
+            result = {"ticket": action.ticket, "action": action.action, "success": False}
+
+            if action.action == "HOLD":
+                result["success"] = True
+                result["message"] = action.reason
+
+            elif action.action == "CLOSE":
+                close_result = self._close_position(action.ticket)
+                result["success"] = close_result["success"]
+                result["message"] = close_result.get("message", action.reason)
+                if close_result["success"]:
+                    logger.info(f"CLOSED #{action.ticket}: {action.reason}")
+                    # Clean up tracking
+                    self._peak_profits.pop(action.ticket, None)
+
+            elif action.action == "TRAIL_SL":
+                trail_result = self._modify_sl(action.ticket, action.new_sl)
+                result["success"] = trail_result["success"]
+                result["message"] = trail_result.get("message", action.reason)
+                if trail_result["success"]:
+                    logger.info(f"TRAILED SL #{action.ticket} to {action.new_sl:.2f}: {action.reason}")
+
+            results.append(result)
+
+        return results
+
+    def _close_position(self, ticket: int) -> Dict:
+        """Close a position by ticket."""
+        position = mt5.positions_get(ticket=ticket)
+        if not position:
+            return {"success": False, "message": "Position not found"}
+
+        pos = position[0]
+        symbol = pos.symbol
+        volume = pos.volume
+        pos_type = pos.type
+
+        tick = mt5.symbol_info_tick(symbol)
+        if not tick:
+            return {"success": False, "message": "Cannot get tick"}
+
+        close_price = tick.bid if pos_type == 0 else tick.ask
+        close_type = mt5.ORDER_TYPE_SELL if pos_type == 0 else mt5.ORDER_TYPE_BUY
+
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": symbol,
+            "volume": volume,
+            "type": close_type,
+            "position": ticket,
+            "price": close_price,
+            "deviation": 20,
+            "magic": 123456,
+            "comment": "Smart exit",
+            "type_time": mt5.ORDER_TIME_GTC,
+        }
+
+        result = mt5.order_send(request)
+        if result.retcode == mt5.TRADE_RETCODE_DONE:
+            return {"success": True, "message": f"Closed at {close_price:.2f}"}
+        else:
+            return {"success": False, "message": f"Failed: {result.comment} ({result.retcode})"}
+
+    def _modify_sl(self, ticket: int, new_sl: float) -> Dict:
+        """Modify stop loss of a position."""
+        position = mt5.positions_get(ticket=ticket)
+        if not position:
+            return {"success": False, "message": "Position not found"}
+
+        pos = position[0]
+
+        request = {
+            "action": mt5.TRADE_ACTION_SLTP,
+            "symbol": pos.symbol,
+            "position": ticket,
+            "sl": new_sl,
+            "tp": pos.tp,  # Keep existing TP
+        }
+
+        result = mt5.order_send(request)
+        if result.retcode == mt5.TRADE_RETCODE_DONE:
+            return {"success": True, "message": f"SL modified to {new_sl:.2f}"}
+        else:
+            return {"success": False, "message": f"Failed: {result.comment} ({result.retcode})"}
+
+    def get_position_summary(self, positions: pl.DataFrame) -> Dict:
+        """Get summary of all positions."""
+        if len(positions) == 0:
+            return {"count": 0, "total_profit": 0, "avg_profit": 0}
+
+        total_profit = 0
+        for row in positions.iter_rows(named=True):
+            total_profit += row.get("profit", 0)
+
+        return {
+            "count": len(positions),
+            "total_profit": total_profit,
+            "avg_profit": total_profit / len(positions),
+            "peak_profits": dict(self._peak_profits),
+        }

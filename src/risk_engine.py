@@ -1,313 +1,536 @@
-"""Risk management engine.
+"""
+Risk Engine Module
+==================
+Risk management and position sizing logic.
 
-Provides position sizing, drawdown tracking, risk-reward validation,
-and kill switch functionality.
+Features:
+- Risk-Constrained Kelly Criterion
+- Daily loss limits (Circuit Breaker)
+- Position size calculation
+- Exposure management
 """
 
-from __future__ import annotations
-
-import logging
+import polars as pl
+import numpy as np
+from typing import Optional, Tuple, Dict, List
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Dict, Optional
+from datetime import datetime, date
+from loguru import logger
 
-logger = logging.getLogger(__name__)
+from .config import TradingConfig, RiskConfig
 
-@dataclass
-class DrawdownTracker:
-    start_balance: float = 0.0
-    peak_balance: float = 0.0
-    current_equity: float = 0.0
-    daily_start: float = 0.0
-    weekly_start: float = 0.0
-    monthly_start: float = 0.0
-    last_reset_day: int = 0
-    last_reset_week: int = 0
-    last_reset_month: int = 0
-
-    @property
-    def daily_drawdown(self) -> float:
-        if self.daily_start <= 0:
-            return 0.0
-        return (self.daily_start - self.current_equity) / self.daily_start
-
-    @property
-    def weekly_drawdown(self) -> float:
-        if self.weekly_start <= 0:
-            return 0.0
-        return (self.weekly_start - self.current_equity) / self.weekly_start
-
-    @property
-    def monthly_drawdown(self) -> float:
-        if self.monthly_start <= 0:
-            return 0.0
-        return (self.monthly_start - self.current_equity) / self.monthly_start
-
-    @property
-    def max_drawdown(self) -> float:
-        if self.peak_balance <= 0:
-            return 0.0
-        return (self.peak_balance - self.current_equity) / self.peak_balance
 
 @dataclass
-class RiskCheck:
-    allowed: bool = True
-    reason: str = ""
-    position_size: float = 0.0
-    risk_amount: float = 0.0
+class RiskMetrics:
+    """Current risk metrics."""
+    daily_pnl: float
+    daily_pnl_percent: float
+    open_exposure: float
+    max_drawdown: float
+    position_count: int
+    can_trade: bool
+    reason: str
+
+
+@dataclass
+class PositionSizeResult:
+    """Result of position size calculation."""
+    lot_size: float
+    risk_amount: float
+    risk_percent: float
+    stop_distance: float
+    take_profit_distance: float
+    approved: bool
+    rejection_reason: Optional[str] = None
 
 
 class RiskEngine:
-    """Risk management engine for position sizing and drawdown control.
-
-    Attributes:
-        max_risk_per_trade: Maximum risk per trade as decimal.
-        max_daily_dd: Maximum daily drawdown as decimal.
-        max_weekly_dd: Maximum weekly drawdown.
-        max_monthly_dd: Maximum monthly drawdown.
-        max_positions: Maximum concurrent positions.
-        min_rr: Minimum risk-reward ratio.
     """
-
-    def __init__(
+    Risk management engine with circuit breakers.
+    
+    Implements:
+    - Risk-Constrained Kelly Criterion for position sizing
+    - Daily loss limits
+    - Maximum exposure limits
+    - Flash crash protection
+    """
+    
+    def __init__(self, config: TradingConfig):
+        """
+        Initialize risk engine.
+        
+        Args:
+            config: Trading configuration
+        """
+        self.config = config
+        self.risk_config = config.risk
+        
+        # Track daily stats
+        self._daily_stats: Dict[date, Dict] = {}
+        self._trade_log: List[Dict] = []
+        self._circuit_breaker_active = False
+        self._circuit_breaker_reason = ""
+    
+    def check_risk(
         self,
-        max_risk_per_trade: float = 0.02,
-        max_daily_dd: float = 0.05,
-        max_weekly_dd: float = 0.08,
-        max_monthly_dd: float = 0.12,
-        max_positions: int = 3,
-        min_rr: float = 1.5,
-    ) -> None:
-        self.max_risk_per_trade = max_risk_per_trade
-        self.max_daily_dd = max_daily_dd
-        self.max_weekly_dd = max_weekly_dd
-        self.max_monthly_dd = max_monthly_dd
-        self.max_positions = max_positions
-        self.min_rr = min_rr
-        self._kill_switch = False
-        self.tracker = DrawdownTracker()
-
-    @property
-    def kill_switch_active(self) -> bool:
-        return self._kill_switch
-
-    def initialize(self, balance: float) -> None:
-        """Initialize the risk engine with account balance.
-
-        Args:
-            balance: Current account balance.
+        account_balance: float,
+        account_equity: float,
+        open_positions: pl.DataFrame,
+        current_price: float,
+    ) -> RiskMetrics:
         """
-        self.tracker.start_balance = balance
-        self.tracker.peak_balance = balance
-        self.tracker.current_equity = balance
-        self.tracker.daily_start = balance
-        self.tracker.weekly_start = balance
-        self.tracker.monthly_start = balance
-        now = datetime.now(timezone.utc)
-        self.tracker.last_reset_day = now.day
-        self.tracker.last_reset_week = now.isocalendar()[1]
-        self.tracker.last_reset_month = now.month
-        self._kill_switch = False
-        logger.info("Risk engine initialized: balance=%.2f", balance)
-
-    def update_equity(self, equity: float) -> None:
-        """Update current equity and check drawdown levels.
-
+        Check current risk status.
+        
         Args:
-            equity: Current account equity.
+            account_balance: Current account balance
+            account_equity: Current account equity
+            open_positions: DataFrame of open positions
+            current_price: Current market price
+            
+        Returns:
+            RiskMetrics with current status
         """
-        self.tracker.current_equity = equity
-        if equity > self.tracker.peak_balance:
-            self.tracker.peak_balance = equity
+        today = date.today()
+        
+        # Initialize daily stats if needed (use equity as starting balance)
+        if today not in self._daily_stats:
+            self._daily_stats[today] = {
+                "starting_balance": account_equity,  # Use equity to include open positions
+                "trades": 0,
+                "wins": 0,
+                "losses": 0,
+            }
+            # Reset circuit breaker on new day/first run
+            self._circuit_breaker_active = False
+            self._circuit_breaker_reason = ""
+        
+        daily = self._daily_stats[today]
 
-        now = datetime.now(timezone.utc)
-        if now.day != self.tracker.last_reset_day:
-            self.tracker.daily_start = equity
-            self.tracker.last_reset_day = now.day
-        if now.isocalendar()[1] != self.tracker.last_reset_week:
-            self.tracker.weekly_start = equity
-            self.tracker.last_reset_week = now.isocalendar()[1]
-        if now.month != self.tracker.last_reset_month:
-            self.tracker.monthly_start = equity
-            self.tracker.last_reset_month = now.month
+        # Safety: Update starting balance if it was 0 (edge case on startup)
+        if daily["starting_balance"] == 0 and account_equity > 0:
+            daily["starting_balance"] = account_equity
 
-        if self.tracker.daily_drawdown >= self.max_daily_dd:
-            self._kill_switch = True
-            logger.critical("KILL SWITCH: Daily DD %.2f%% >= %.2f%%",
-                          self.tracker.daily_drawdown * 100, self.max_daily_dd * 100)
-
+        # Calculate daily P&L (with division safety)
+        daily_pnl = account_equity - daily["starting_balance"]
+        if daily["starting_balance"] > 0:
+            daily_pnl_percent = (daily_pnl / daily["starting_balance"]) * 100
+        else:
+            daily_pnl_percent = 0.0
+        
+        # Calculate open exposure
+        open_exposure = 0.0
+        position_count = 0
+        if len(open_positions) > 0:
+            position_count = len(open_positions)
+            # Sum of position values
+            for row in open_positions.iter_rows(named=True):
+                open_exposure += abs(row.get("volume", 0)) * current_price
+        
+        # Calculate max drawdown (equity from peak)
+        max_drawdown = 0.0
+        if hasattr(self, "_peak_equity"):
+            if account_equity > self._peak_equity:
+                self._peak_equity = account_equity
+            max_drawdown = ((self._peak_equity - account_equity) / self._peak_equity) * 100
+        else:
+            self._peak_equity = account_equity
+        
+        # Check if trading is allowed
+        can_trade = True
+        reason = "OK"
+        
+        # Circuit breaker checks
+        if self._circuit_breaker_active:
+            can_trade = False
+            reason = self._circuit_breaker_reason
+        
+        # Daily loss limit (only trigger on LOSSES, not profits)
+        elif daily_pnl_percent <= -self.risk_config.max_daily_loss:
+            can_trade = False
+            reason = f"Daily loss limit reached: {daily_pnl_percent:.2f}%"
+            self._activate_circuit_breaker(reason)
+        
+        # Maximum positions
+        elif position_count >= self.risk_config.max_positions:
+            can_trade = False
+            reason = f"Maximum positions reached: {position_count}"
+        
+        return RiskMetrics(
+            daily_pnl=daily_pnl,
+            daily_pnl_percent=daily_pnl_percent,
+            open_exposure=open_exposure,
+            max_drawdown=max_drawdown,
+            position_count=position_count,
+            can_trade=can_trade,
+            reason=reason,
+        )
+    
     def calculate_position_size(
         self,
-        balance: float,
-        risk_pct: Optional[float] = None,
-        sl_points: float = 0.0,
-        point_value: float = 0.01,
-        contract_size: float = 100.0,
-        min_lot: float = 0.01,
-        max_lot: float = 1.0,
-    ) -> float:
-        """Calculate position size based on risk parameters.
-
-        Args:
-            balance: Account balance.
-            risk_pct: Risk percentage (decimal). None uses default.
-            sl_points: Stop loss in points.
-            point_value: Value per point.
-            contract_size: Contract size.
-            min_lot: Minimum lot size.
-            max_lot: Maximum lot size.
-
-        Returns:
-            float: Position size in lots.
+        entry_price: float,
+        stop_loss_price: float,
+        take_profit_price: float,
+        account_balance: float,
+        win_rate: float = 0.5,
+        avg_win_loss_ratio: float = 2.0,
+        regime_multiplier: float = 1.0,
+    ) -> PositionSizeResult:
         """
-        risk = risk_pct or self.max_risk_per_trade
-        risk_amount = balance * risk
-
-        if sl_points <= 0:
-            logger.warning("Invalid SL points: %.2f", sl_points)
-            return min_lot
-
-        pip_value_per_lot = contract_size * point_value
-        sl_value = sl_points * pip_value_per_lot
-
-        if sl_value <= 0:
-            return min_lot
-
-        lot_size = risk_amount / sl_value
-        lot_size = max(min_lot, min(lot_size, max_lot))
-        lot_size = round(lot_size, 2)
-
-        logger.debug(
-            "Position size: balance=%.2f risk=%.2f%% SL=%.0f pts -> %.2f lots",
-            balance, risk * 100, sl_points, lot_size,
+        Calculate position size using Risk-Constrained Kelly Criterion.
+        
+        Kelly Formula: f* = (p * b - q) / b
+        Where:
+        - p = probability of winning
+        - q = probability of losing (1 - p)
+        - b = win/loss ratio
+        
+        We use Half-Kelly for safety.
+        
+        Args:
+            entry_price: Planned entry price
+            stop_loss_price: Stop loss price
+            take_profit_price: Take profit price
+            account_balance: Current account balance
+            win_rate: Historical win rate (0-1)
+            avg_win_loss_ratio: Average win/loss ratio
+            regime_multiplier: Position size multiplier from regime detection
+            
+        Returns:
+            PositionSizeResult with calculated lot size
+        """
+        # Validate inputs
+        if entry_price <= 0 or stop_loss_price <= 0 or take_profit_price <= 0:
+            return PositionSizeResult(
+                lot_size=0,
+                risk_amount=0,
+                risk_percent=0,
+                stop_distance=0,
+                take_profit_distance=0,
+                approved=False,
+                rejection_reason="Invalid price levels",
+            )
+        
+        # Calculate distances
+        stop_distance = abs(entry_price - stop_loss_price)
+        tp_distance = abs(take_profit_price - entry_price)
+        
+        if stop_distance == 0:
+            return PositionSizeResult(
+                lot_size=0,
+                risk_amount=0,
+                risk_percent=0,
+                stop_distance=0,
+                take_profit_distance=tp_distance,
+                approved=False,
+                rejection_reason="Stop loss distance is zero",
+            )
+        
+        # Calculate Kelly fraction
+        p = win_rate
+        q = 1 - p
+        b = avg_win_loss_ratio
+        
+        # Full Kelly
+        if b > 0:
+            kelly = (p * b - q) / b
+        else:
+            kelly = 0
+        
+        # Cap Kelly at reasonable level (never risk more than 25%)
+        kelly = max(0, min(kelly, 0.25))
+        
+        # Use Half-Kelly for safety
+        half_kelly = kelly * 0.5
+        
+        # Apply regime multiplier
+        adjusted_kelly = half_kelly * regime_multiplier
+        
+        # Calculate risk amount (but cap at config limit)
+        max_risk_percent = self.risk_config.risk_per_trade / 100
+        actual_risk_percent = min(adjusted_kelly, max_risk_percent)
+        risk_amount = account_balance * actual_risk_percent
+        
+        # Calculate lot size
+        # For XAUUSD: pip value varies, using simplified calculation
+        symbol = self.config.symbol
+        if "XAU" in symbol:
+            # Gold: $1 per 0.01 lot per point ($0.1 move)
+            pip_value_per_lot = 1.0
+            pips = stop_distance / 0.1
+        else:
+            # Standard forex
+            pip_value_per_lot = 10.0
+            pips = stop_distance / 0.0001
+        
+        if pips > 0 and pip_value_per_lot > 0:
+            lot_size = risk_amount / (pips * pip_value_per_lot)
+        else:
+            lot_size = 0
+        
+        # Round to lot step and apply limits
+        lot_size = round(lot_size / self.risk_config.lot_step) * self.risk_config.lot_step
+        lot_size = max(self.risk_config.min_lot_size, min(lot_size, self.risk_config.max_lot_size))
+        
+        # Validate position
+        approved = True
+        rejection_reason = None
+        
+        if lot_size < self.risk_config.min_lot_size:
+            approved = False
+            rejection_reason = f"Lot size {lot_size} below minimum {self.risk_config.min_lot_size}"
+        
+        actual_risk = lot_size * pips * pip_value_per_lot
+        actual_risk_pct = (actual_risk / account_balance) * 100
+        
+        return PositionSizeResult(
+            lot_size=lot_size,
+            risk_amount=actual_risk,
+            risk_percent=actual_risk_pct,
+            stop_distance=stop_distance,
+            take_profit_distance=tp_distance,
+            approved=approved,
+            rejection_reason=rejection_reason,
         )
-        return lot_size
-
-    def check_daily_drawdown(
+    
+    def validate_order(
         self,
-        current_equity: float,
-        start_of_day_balance: Optional[float] = None,
-    ) -> bool:
-        """Check if daily drawdown limit is exceeded.
-
-        Args:
-            current_equity: Current account equity.
-            start_of_day_balance: Balance at start of trading day.
-
-        Returns:
-            bool: True if within limits.
+        order_type: str,
+        entry_price: float,
+        stop_loss: float,
+        take_profit: float,
+        lot_size: float,
+        current_price: float,
+        account_balance: float,
+    ) -> Tuple[bool, str]:
         """
-        start = start_of_day_balance or self.tracker.daily_start
-        if start <= 0:
-            return True
-        dd = (start - current_equity) / start
-        return dd < self.max_daily_dd
-
-    def validate_risk_reward(
+        Validate order before execution.
+        
+        Args:
+            order_type: "BUY" or "SELL"
+            entry_price: Entry price
+            stop_loss: Stop loss price
+            take_profit: Take profit price
+            lot_size: Lot size
+            current_price: Current market price
+            account_balance: Account balance
+            
+        Returns:
+            Tuple of (is_valid, reason)
+        """
+        # Check circuit breaker
+        if self._circuit_breaker_active:
+            return False, f"Circuit breaker active: {self._circuit_breaker_reason}"
+        
+        # Validate price levels
+        if order_type == "BUY":
+            if stop_loss >= entry_price:
+                return False, "Buy SL must be below entry"
+            if take_profit <= entry_price:
+                return False, "Buy TP must be above entry"
+        else:  # SELL
+            if stop_loss <= entry_price:
+                return False, "Sell SL must be above entry"
+            if take_profit >= entry_price:
+                return False, "Sell TP must be below entry"
+        
+        # Check lot size
+        if lot_size < self.risk_config.min_lot_size:
+            return False, f"Lot size below minimum: {lot_size} < {self.risk_config.min_lot_size}"
+        if lot_size > self.risk_config.max_lot_size:
+            return False, f"Lot size above maximum: {lot_size} > {self.risk_config.max_lot_size}"
+        
+        # Check entry price deviation from current
+        max_deviation = 0.001  # 0.1%
+        if abs(entry_price / current_price - 1) > max_deviation:
+            return False, f"Entry price deviates too much from current: {entry_price} vs {current_price}"
+        
+        # Calculate risk
+        stop_distance = abs(entry_price - stop_loss)
+        if "XAU" in self.config.symbol:
+            pips = stop_distance / 0.1
+            pip_value = 1.0
+        else:
+            pips = stop_distance / 0.0001
+            pip_value = 10.0
+        
+        risk_amount = lot_size * pips * pip_value
+        risk_percent = (risk_amount / account_balance) * 100
+        
+        if risk_percent > self.risk_config.risk_per_trade * 1.5:  # Allow 50% margin
+            return False, f"Risk too high: {risk_percent:.2f}% > {self.risk_config.risk_per_trade * 1.5:.2f}%"
+        
+        return True, "Order validated"
+    
+    def record_trade(
         self,
-        sl_points: float,
-        tp_points: float,
-        min_rr: Optional[float] = None,
-    ) -> bool:
-        """Validate risk-reward ratio.
-
-        Args:
-            sl_points: Stop loss in points.
-            tp_points: Take profit in points.
-            min_rr: Minimum RR ratio. None uses default.
-
-        Returns:
-            bool: True if RR meets minimum requirement.
+        order_type: str,
+        entry_price: float,
+        exit_price: Optional[float],
+        lot_size: float,
+        pnl: float,
+        is_win: bool,
+    ):
         """
-        if sl_points <= 0:
-            return False
-        rr = tp_points / sl_points
-        min_ratio = min_rr or self.min_rr
-        is_valid = rr >= min_ratio
-        if not is_valid:
-            logger.debug("RR %.2f < min %.2f", rr, min_ratio)
-        return is_valid
-
-    def check_max_positions(self, current_positions: int) -> bool:
-        """Check if max positions limit allows a new trade.
-
+        Record trade for statistics.
+        
         Args:
-            current_positions: Number of currently open positions.
-
-        Returns:
-            bool: True if new position is allowed.
+            order_type: "BUY" or "SELL"
+            entry_price: Entry price
+            exit_price: Exit price (if closed)
+            lot_size: Lot size
+            pnl: Profit/loss amount
+            is_win: Whether trade was profitable
         """
-        return current_positions < self.max_positions
+        trade = {
+            "timestamp": datetime.now(),
+            "type": order_type,
+            "entry": entry_price,
+            "exit": exit_price,
+            "lot_size": lot_size,
+            "pnl": pnl,
+            "is_win": is_win,
+        }
+        self._trade_log.append(trade)
+        
+        # Update daily stats
+        today = date.today()
+        if today in self._daily_stats:
+            self._daily_stats[today]["trades"] += 1
+            if is_win:
+                self._daily_stats[today]["wins"] += 1
+            else:
+                self._daily_stats[today]["losses"] += 1
+        
+        logger.info(f"Trade recorded: {order_type} {lot_size} lots, P&L: {pnl:.2f}")
+    
+    def get_win_rate(self, lookback: int = 100) -> float:
+        """Get recent win rate."""
+        recent = self._trade_log[-lookback:]
+        if not recent:
+            return 0.5  # Default
+        
+        wins = sum(1 for t in recent if t["is_win"])
+        return wins / len(recent)
+    
+    def get_avg_rr(self, lookback: int = 100) -> float:
+        """Get average risk/reward ratio."""
+        recent = self._trade_log[-lookback:]
+        if not recent:
+            return 2.0  # Default
+        
+        wins = [t["pnl"] for t in recent if t["is_win"] and t["pnl"] > 0]
+        losses = [abs(t["pnl"]) for t in recent if not t["is_win"] and t["pnl"] < 0]
+        
+        if not wins or not losses:
+            return 2.0
+        
+        return np.mean(wins) / np.mean(losses)
+    
+    def _activate_circuit_breaker(self, reason: str):
+        """Activate circuit breaker."""
+        self._circuit_breaker_active = True
+        self._circuit_breaker_reason = reason
+        logger.warning(f"CIRCUIT BREAKER ACTIVATED: {reason}")
+    
+    def reset_circuit_breaker(self):
+        """Reset circuit breaker (manual override)."""
+        self._circuit_breaker_active = False
+        self._circuit_breaker_reason = ""
+        logger.info("Circuit breaker reset")
+    
+    def reset_daily_stats(self):
+        """Reset daily statistics (called at start of new day)."""
+        today = date.today()
+        self._daily_stats[today] = {
+            "starting_balance": 0,  # Will be set on first check
+            "trades": 0,
+            "wins": 0,
+            "losses": 0,
+        }
+        self._circuit_breaker_active = False
+        self._circuit_breaker_reason = ""
+        logger.info("Daily stats reset")
+    
+    def get_daily_summary(self) -> Dict:
+        """Get daily trading summary."""
+        today = date.today()
+        if today not in self._daily_stats:
+            return {"trades": 0, "wins": 0, "losses": 0, "pnl": 0}
+        
+        stats = self._daily_stats[today]
+        return {
+            "trades": stats["trades"],
+            "wins": stats["wins"],
+            "losses": stats["losses"],
+            "win_rate": stats["wins"] / stats["trades"] if stats["trades"] > 0 else 0,
+        }
 
-    def check_margin(
-        self,
-        free_margin: float,
-        required_margin: float,
-        buffer: float = 1.5,
-    ) -> bool:
-        """Check if there is enough free margin.
 
-        Args:
-            free_margin: Available free margin.
-            required_margin: Required margin for the trade.
-            buffer: Safety buffer multiplier.
-
-        Returns:
-            bool: True if enough margin.
-        """
-        return free_margin >= required_margin * buffer
-
-    def full_check(
-        self,
-        balance: float,
-        equity: float,
-        free_margin: float,
-        current_positions: int,
-        sl_points: float,
-        tp_points: float,
-        required_margin: float = 0.0,
-    ) -> RiskCheck:
-        """Perform complete risk check before opening a trade.
-
-        Args:
-            balance: Account balance.
-            equity: Account equity.
-            free_margin: Free margin.
-            current_positions: Number of open positions.
-            sl_points: Stop loss in points.
-            tp_points: Take profit in points.
-            required_margin: Required margin for trade.
-
-        Returns:
-            RiskCheck: Complete risk assessment.
-        """
-        self.update_equity(equity)
-
-        if self._kill_switch:
-            return RiskCheck(allowed=False, reason="Kill switch activated")
-
-        if not self.check_daily_drawdown(equity):
-            return RiskCheck(allowed=False, reason="Daily drawdown exceeded")
-
-        if not self.check_max_positions(current_positions):
-            return RiskCheck(allowed=False, reason=f"Max positions ({self.max_positions}) reached")
-
-        if not self.validate_risk_reward(sl_points, tp_points):
-            return RiskCheck(allowed=False, reason=f"RR < {self.min_rr}")
-
-        if required_margin > 0 and not self.check_margin(free_margin, required_margin):
-            return RiskCheck(allowed=False, reason="Insufficient margin")
-
-        pos_size = self.calculate_position_size(balance, sl_points=sl_points)
-        risk_amount = balance * self.max_risk_per_trade
-
-        return RiskCheck(
-            allowed=True,
-            position_size=pos_size,
-            risk_amount=risk_amount,
-        )
-
-    def reset_kill_switch(self) -> None:
-        """Manually reset the kill switch."""
-        self._kill_switch = False
-        logger.info("Kill switch reset")
+if __name__ == "__main__":
+    # Test risk engine
+    from .config import TradingConfig
+    
+    # Create test config
+    config = TradingConfig(capital=5000)
+    engine = RiskEngine(config)
+    
+    print("\n=== Risk Engine Test ===")
+    print(f"Config: {config.capital_mode.value}")
+    print(f"Risk per trade: {config.risk.risk_per_trade}%")
+    print(f"Max daily loss: {config.risk.max_daily_loss}%")
+    
+    # Test position sizing
+    result = engine.calculate_position_size(
+        entry_price=2000.0,
+        stop_loss_price=1995.0,  # 50 pips
+        take_profit_price=2010.0,  # 100 pips
+        account_balance=5000.0,
+        win_rate=0.55,
+        avg_win_loss_ratio=2.0,
+        regime_multiplier=1.0,
+    )
+    
+    print(f"\n=== Position Size Result ===")
+    print(f"Lot size: {result.lot_size}")
+    print(f"Risk amount: ${result.risk_amount:.2f}")
+    print(f"Risk percent: {result.risk_percent:.2f}%")
+    print(f"Stop distance: {result.stop_distance}")
+    print(f"Approved: {result.approved}")
+    if result.rejection_reason:
+        print(f"Rejection: {result.rejection_reason}")
+    
+    # Test order validation
+    valid, reason = engine.validate_order(
+        order_type="BUY",
+        entry_price=2000.0,
+        stop_loss=1995.0,
+        take_profit=2010.0,
+        lot_size=result.lot_size,
+        current_price=2000.0,
+        account_balance=5000.0,
+    )
+    
+    print(f"\n=== Order Validation ===")
+    print(f"Valid: {valid}")
+    print(f"Reason: {reason}")
+    
+    # Test risk check
+    open_positions = pl.DataFrame({
+        "ticket": [],
+        "volume": [],
+        "symbol": [],
+    })
+    
+    metrics = engine.check_risk(
+        account_balance=5000.0,
+        account_equity=4950.0,
+        open_positions=open_positions,
+        current_price=2000.0,
+    )
+    
+    print(f"\n=== Risk Metrics ===")
+    print(f"Daily P&L: ${metrics.daily_pnl:.2f} ({metrics.daily_pnl_percent:.2f}%)")
+    print(f"Open exposure: ${metrics.open_exposure:.2f}")
+    print(f"Max drawdown: {metrics.max_drawdown:.2f}%")
+    print(f"Can trade: {metrics.can_trade}")
+    print(f"Reason: {metrics.reason}")

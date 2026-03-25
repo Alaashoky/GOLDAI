@@ -1,223 +1,615 @@
-from __future__ import annotations
+"""
+Telegram Notification Helpers
+=============================
+Extracts all notification logic from main_live.py into a single module.
 
-import logging
-from datetime import timedelta
-from typing import Any
+This module handles:
+  - Building context dicts from bot state
+  - Sending trade open/close notifications
+  - Sending market updates, hourly reports
+  - Sending critical alerts, emergency notifications
+  - Startup & shutdown notifications
 
-logger = logging.getLogger(__name__)
+Integration:
+    from src.telegram_notifications import TelegramNotifications
+    self.notifications = TelegramNotifications(bot)
+"""
+
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import asyncio
+from datetime import datetime
+from loguru import logger
 
 
 class TelegramNotifications:
-    """Rich Telegram notification templates for GOLDAI.
-
-    All messages use HTML parse mode (Telegram ``parse_mode="HTML"``).
-    Emojis and bold/italic tags provide quick visual scanning on mobile.
+    """
+    High-level notification helper that reads bot state and sends
+    formatted Telegram messages via bot.telegram (TelegramNotifier).
     """
 
-    # ------------------------------------------------------------------
-    # Trade lifecycle
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def format_trade_entry(
-        symbol: str,
-        direction: str,
-        entry: float,
-        sl: float,
-        tp: float,
-        lot: float,
-        confidence: float,
-        regime: str,
-    ) -> str:
-        """Format a trade-entry notification.
-
-        Args:
-            symbol: Instrument symbol (e.g. 'XAUUSD').
-            direction: 'LONG' or 'SHORT'.
-            entry: Entry price.
-            sl: Stop-loss price.
-            tp: Take-profit price.
-            lot: Lot size.
-            confidence: Signal confidence in [0, 1].
-            regime: Market regime string ('trending', 'ranging', 'volatile').
-
-        Returns:
-            HTML-formatted Telegram message.
+    def __init__(self, bot):
         """
-        dir_icon = "🟢" if direction.upper() == "LONG" else "🔴"
-        sl_pips = round(abs(entry - sl) * 10, 1)
-        tp_pips = round(abs(tp - entry) * 10, 1)
-        rr = round(tp_pips / sl_pips, 2) if sl_pips else 0.0
+        Args:
+            bot: TradingBot instance (has .telegram, .mt5, .smart_risk, etc.)
+        """
+        self.bot = bot
 
-        return (
-            f"{dir_icon} <b>NEW TRADE – {symbol}</b>\n"
-            "━━━━━━━━━━━━━━━\n"
-            f"Direction:   <b>{direction.upper()}</b>\n"
-            f"Entry:       <b>{entry:.4f}</b>\n"
-            f"Stop Loss:   <b>{sl:.4f}</b>  ({sl_pips} pips)\n"
-            f"Take Profit: <b>{tp:.4f}</b>  ({tp_pips} pips)\n"
-            f"R:R Ratio:   <b>1 : {rr}</b>\n"
-            f"Lot Size:    <b>{lot:.2f}</b>\n"
-            f"Confidence:  <b>{confidence:.0%}</b>\n"
-            f"Regime:      <i>{regime.capitalize()}</i>\n"
+    # ------------------------------------------------------------------
+    # Startup notification
+    # ------------------------------------------------------------------
+    async def send_startup(self):
+        """Send bot startup notification with full context."""
+        bot = self.bot
+        balance = bot.mt5.account_balance or bot.config.capital
+        session_status = bot.session_filter.get_status_report()
+        risk_state = bot.smart_risk.get_state()
+        risk_rec = bot.smart_risk.get_trading_recommendation()
+        ml_status = (
+            f"Loaded ({len(bot.ml_model.feature_names)} features)"
+            if bot.ml_model.fitted
+            else "Not loaded"
         )
 
-    @staticmethod
-    def format_trade_exit(
-        symbol: str,
-        direction: str,
-        profit_pips: float,
-        profit_usd: float,
-        duration: timedelta | float,
+        ctx = {
+            "risk_per_trade": bot.config.risk.risk_per_trade,
+            "max_daily_loss": bot.config.risk.max_daily_loss,
+            "max_total_loss": bot.smart_risk.max_total_loss_percent,
+            "max_lot": bot.smart_risk.max_lot_size,
+            "max_positions": bot.smart_risk.max_concurrent_positions,
+            "cooldown_seconds": bot._trade_cooldown_seconds,
+            "daily_loss": risk_state.daily_loss,
+            "total_loss": bot.smart_risk._total_loss,
+            "consecutive_losses": risk_state.consecutive_losses,
+            "risk_mode": risk_rec.get("mode", "normal"),
+            "session": session_status.get("current_session", "Unknown"),
+            "can_trade": session_status.get("can_trade", False),
+            "volatility": session_status.get("volatility", "unknown"),
+        }
+
+        await bot.telegram.send_startup_message(
+            symbol=bot.config.symbol,
+            capital=bot.config.capital,
+            balance=balance,
+            mode=bot.config.capital_mode.value,
+            ml_model_status=ml_status,
+            news_status="DISABLED",
+            context=ctx,
+        )
+
+    # ------------------------------------------------------------------
+    # Shutdown notification
+    # ------------------------------------------------------------------
+    async def send_shutdown(self):
+        """Send bot shutdown notification with session summary."""
+        bot = self.bot
+        try:
+            balance = bot.mt5.account_balance or bot.config.capital
+            uptime_hours = (datetime.now() - bot._start_time).total_seconds() / 3600
+            risk_state = bot.smart_risk.get_state()
+
+            ctx = {
+                "risk_mode": bot.smart_risk.get_trading_recommendation().get("mode", "normal"),
+                "daily_loss": risk_state.daily_loss,
+                "daily_profit": risk_state.daily_profit,
+                "total_loss": bot.smart_risk._total_loss,
+                "consecutive_losses": risk_state.consecutive_losses,
+                "session": bot.session_filter.get_status_report().get("current_session", "Unknown"),
+            }
+
+            await bot.telegram.send_shutdown_message(
+                balance=balance,
+                total_trades=bot._total_session_trades,
+                total_profit=bot._total_session_profit,
+                uptime_hours=uptime_hours,
+                context=ctx,
+            )
+        except Exception as e:
+            logger.error(f"Failed to send shutdown notification: {e}")
+
+    # ------------------------------------------------------------------
+    # Trade close — smart position manager
+    # ------------------------------------------------------------------
+    async def notify_trade_close_smart(
+        self,
+        ticket: int,
+        profit: float,
+        current_price: float,
         reason: str,
-    ) -> str:
-        """Format a trade-exit notification.
+    ):
+        """Send notification for smart close (from SmartRiskManager)."""
+        bot = self.bot
+        try:
+            trade_info = bot._open_trade_info.pop(ticket, {})
 
-        Args:
-            symbol: Instrument symbol.
-            direction: 'LONG' or 'SHORT'.
-            profit_pips: Profit/loss in pips (negative = loss).
-            profit_usd: Profit/loss in USD.
-            duration: Trade duration as timedelta or hours (float).
-            reason: Exit reason string.
+            balance_before = trade_info.get("balance_before", 0)
+            balance_after = bot.mt5.account_balance or 0
+            entry_price = trade_info.get("entry_price", current_price)
+            duration = int(
+                (datetime.now() - trade_info.get("open_time", datetime.now())).total_seconds()
+            )
 
-        Returns:
-            HTML-formatted Telegram message.
-        """
-        win = profit_usd >= 0
-        result_icon = "✅" if win else "❌"
-        pnl_icon = "📈" if win else "📉"
+            # Track stats
+            bot._total_session_profit += profit
+            bot._total_session_trades += 1
+            if profit > 0:
+                bot._total_session_wins += 1
 
-        if isinstance(duration, timedelta):
-            hours = duration.total_seconds() / 3600
-        else:
-            hours = float(duration)
-        dur_str = f"{hours:.1f}h"
+            ctx = self._build_close_context(reason)
 
-        return (
-            f"{result_icon} <b>TRADE CLOSED – {symbol}</b>\n"
-            "━━━━━━━━━━━━━━━\n"
-            f"Direction:  <b>{direction.upper()}</b>\n"
-            f"Result:     {pnl_icon} <b>{profit_pips:+.1f} pips</b>  "
-            f"(<b>${profit_usd:+,.2f}</b>)\n"
-            f"Duration:   <b>{dur_str}</b>\n"
-            f"Reason:     <i>{reason}</i>\n"
-        )
-
-    # ------------------------------------------------------------------
-    # Periodic reports
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def format_daily_summary(
-        stats: dict[str, Any],
-        equity: float,
-        trades_today: int,
-    ) -> str:
-        """Format the end-of-day summary notification.
-
-        Args:
-            stats: Dict with keys: wins, losses, net_pnl, win_rate, best_trade,
-                   worst_trade.
-            equity: Current account equity.
-            trades_today: Number of trades taken today.
-
-        Returns:
-            HTML-formatted daily summary message.
-        """
-        wins = stats.get("wins", 0)
-        losses = stats.get("losses", 0)
-        net_pnl = stats.get("net_pnl", 0.0)
-        win_rate = stats.get("win_rate", 0.0)
-        best = stats.get("best_trade", 0.0)
-        worst = stats.get("worst_trade", 0.0)
-        pnl_icon = "📈" if net_pnl >= 0 else "📉"
-
-        return (
-            "📅 <b>Daily Summary</b>\n"
-            "━━━━━━━━━━━━━━━\n"
-            f"Trades:      <b>{trades_today}</b>  "
-            f"(✅ {wins} / ❌ {losses})\n"
-            f"Win Rate:    <b>{win_rate:.1%}</b>\n"
-            f"Net P&L:     {pnl_icon} <b>${net_pnl:+,.2f}</b>\n"
-            f"Best Trade:  📈 <b>${best:+,.2f}</b>\n"
-            f"Worst Trade: 📉 <b>${worst:+,.2f}</b>\n"
-            f"Equity:      💰 <b>${equity:,.2f}</b>\n"
-        )
-
-    @staticmethod
-    def format_weekly_summary(
-        stats: dict[str, Any],
-        weekly_pnl: float,
-    ) -> str:
-        """Format the end-of-week summary notification.
-
-        Args:
-            stats: Dict with keys: total_trades, win_rate, sharpe, max_drawdown.
-            weekly_pnl: Total P&L for the week.
-
-        Returns:
-            HTML-formatted weekly summary message.
-        """
-        total = stats.get("total_trades", 0)
-        win_rate = stats.get("win_rate", 0.0)
-        sharpe = stats.get("sharpe", 0.0)
-        max_dd = stats.get("max_drawdown", 0.0)
-        pnl_icon = "📈" if weekly_pnl >= 0 else "📉"
-
-        return (
-            "📆 <b>Weekly Summary</b>\n"
-            "━━━━━━━━━━━━━━━\n"
-            f"Total Trades:  <b>{total}</b>\n"
-            f"Win Rate:      <b>{win_rate:.1%}</b>\n"
-            f"Weekly P&L:    {pnl_icon} <b>${weekly_pnl:+,.2f}</b>\n"
-            f"Sharpe Ratio:  <b>{sharpe:.2f}</b>\n"
-            f"Max Drawdown:  ⚠️ <b>{max_dd:.2%}</b>\n"
-        )
+            await bot.telegram.notify_trade_close(
+                ticket=ticket,
+                symbol=bot.config.symbol,
+                order_type=trade_info.get("direction", "BUY"),
+                lot_size=trade_info.get("lot_size", 0.01),
+                entry_price=entry_price,
+                close_price=current_price,
+                profit=profit,
+                profit_pips=(current_price - entry_price) / 0.1,
+                balance_before=balance_before,
+                balance_after=balance_after,
+                duration_seconds=duration,
+                ml_confidence=trade_info.get("ml_confidence", 0),
+                regime=trade_info.get("regime", "unknown"),
+                volatility=trade_info.get("volatility", "unknown"),
+                context=ctx,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to send close notification: {e}")
 
     # ------------------------------------------------------------------
-    # Alerts
+    # Trade close — position manager action
     # ------------------------------------------------------------------
+    async def notify_trade_close_action(self, action, current_price: float):
+        """Send notification for close via PositionManager action."""
+        bot = self.bot
+        try:
+            ticket = action.ticket
+            trade_info = bot._open_trade_info.pop(ticket, {})
+            entry_price = trade_info.get("entry_price", current_price)
+            open_time = trade_info.get("open_time", datetime.now())
+            balance_before = trade_info.get("balance_before", bot._daily_start_balance)
+            ml_confidence = trade_info.get("ml_confidence", 0)
+            regime = trade_info.get("regime", "unknown")
+            volatility = trade_info.get("volatility", "unknown")
 
-    @staticmethod
-    def format_error_alert(error_type: str, message: str) -> str:
-        """Format an error/alert notification.
+            balance_after = bot.mt5.account_balance or bot.config.capital
 
-        Args:
-            error_type: Short error category (e.g. 'ConnectionError').
-            message: Detailed error message.
+            profit = action.profit if hasattr(action, "profit") else 0
+            if profit == 0:
+                profit = balance_after - balance_before
 
-        Returns:
-            HTML-formatted error alert message.
-        """
-        return (
-            "⚠️ <b>GOLDAI Alert</b>\n"
-            "━━━━━━━━━━━━━━━\n"
-            f"Type:    <b>{error_type}</b>\n"
-            f"Message: <i>{message}</i>\n"
+            duration_seconds = int((datetime.now() - open_time).total_seconds())
+
+            price_diff = current_price - entry_price
+            profit_pips = price_diff / 0.1 if "XAU" in bot.config.symbol else price_diff / 0.0001
+
+            # Track session stats
+            bot._total_session_profit += profit
+            bot._total_session_trades += 1
+            if profit > 0:
+                bot._total_session_wins += 1
+
+            exit_reason = action.reason if hasattr(action, "reason") else "position_manager"
+            ctx = self._build_close_context(exit_reason)
+
+            await bot.telegram.notify_trade_close(
+                ticket=ticket,
+                symbol=bot.config.symbol,
+                order_type=trade_info.get("direction", "BUY"),
+                lot_size=trade_info.get("lot_size", 0.01),
+                entry_price=entry_price,
+                close_price=current_price,
+                profit=profit,
+                profit_pips=profit_pips,
+                balance_before=balance_before,
+                balance_after=balance_after,
+                duration_seconds=duration_seconds,
+                ml_confidence=ml_confidence,
+                regime=regime,
+                volatility=volatility,
+                context=ctx,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to send trade close notification: {e}")
+
+    # ------------------------------------------------------------------
+    # Trade open notification
+    # ------------------------------------------------------------------
+    async def notify_trade_open(
+        self,
+        result,
+        signal,
+        position,
+        regime: str,
+        volatility: str,
+        session_status: dict,
+        *,
+        safe_mode: bool = False,
+        smc_fvg: bool = False,
+        smc_ob: bool = False,
+        smc_bos: bool = False,
+        smc_choch: bool = False,
+        dynamic_threshold=None,
+        market_quality=None,
+        market_score=None,
+    ):
+        """Send trade open notification."""
+        bot = self.bot
+
+        # Store trade info for close notification (only if not already stored)
+        # Safe mode pre-stores with actual fill price/lot, so don't overwrite
+        if result.order_id not in bot._open_trade_info:
+            bot._open_trade_info[result.order_id] = {
+                "entry_price": signal.entry_price,
+                "open_time": datetime.now(),
+                "balance_before": bot.mt5.account_balance,
+                "ml_confidence": signal.confidence,
+                "regime": regime,
+                "volatility": volatility,
+                "direction": signal.signal_type,
+                "lot_size": position.lot_size,
+            }
+
+        risk_state = bot.smart_risk.get_state()
+        risk_rec = bot.smart_risk.get_trading_recommendation()
+
+        ctx = {
+            "dynamic_threshold": (
+                float(dynamic_threshold)
+                if dynamic_threshold is not None
+                else getattr(bot, "_last_dynamic_threshold", bot.config.ml.confidence_threshold)
+            ),
+            "market_quality": (
+                str(market_quality)
+                if market_quality is not None
+                else getattr(bot, "_last_market_quality", "unknown")
+            ),
+            "market_score": (
+                int(market_score)
+                if market_score is not None
+                else getattr(bot, "_last_market_score", 0)
+            ),
+            "smc_signal": getattr(bot, "_last_raw_smc_signal", ""),
+            "smc_confidence": getattr(bot, "_last_raw_smc_confidence", 0),
+            "smc_fvg": smc_fvg or getattr(signal, "fvg_detected", False),
+            "smc_ob": smc_ob or getattr(signal, "ob_detected", False),
+            "smc_bos": smc_bos or getattr(signal, "bos_detected", False),
+            "smc_choch": smc_choch or getattr(signal, "choch_detected", False),
+            "session": session_status.get("current_session", "Unknown"),
+            "h1_bias": getattr(bot, "_h1_bias_cache", "NEUTRAL"),
+            "risk_mode": risk_rec.get("mode", "normal"),
+            "daily_loss": risk_state.daily_loss,
+            "consecutive_losses": risk_state.consecutive_losses,
+            "entry_filters": getattr(bot, "_last_filter_results", []),
+        }
+
+        reason = f"SAFE MODE: {signal.reason}" if safe_mode else signal.reason
+        sl = 0 if safe_mode else signal.stop_loss
+
+        try:
+            await bot.telegram.notify_trade_open(
+                ticket=result.order_id,
+                symbol=bot.config.symbol,
+                order_type=signal.signal_type,
+                lot_size=position.lot_size,
+                entry_price=signal.entry_price,
+                stop_loss=sl,
+                take_profit=signal.take_profit,
+                ml_confidence=signal.confidence,
+                signal_reason=reason,
+                regime=regime,
+                volatility=volatility,
+                context=ctx,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to send trade open notification: {e}")
+
+    # ------------------------------------------------------------------
+    # Critical limit alert
+    # ------------------------------------------------------------------
+    async def send_critical_limit_alert(
+        self,
+        limit_type: str,
+        current_loss: float,
+        max_loss: float,
+        max_percent: float,
+    ):
+        """Send critical alert when loss limits are reached."""
+        logger.critical("=" * 60)
+        logger.critical(f"CRITICAL: {limit_type} REACHED!")
+        logger.critical(f"Loss: ${current_loss:.2f} / ${max_loss:.2f} ({max_percent}%)")
+        logger.critical("TRADING HAS BEEN STOPPED!")
+        logger.critical("=" * 60)
+
+        try:
+            if limit_type == "TOTAL LOSS LIMIT":
+                message = (
+                    f"🚨🚨 CRITICAL: TOTAL LOSS LIMIT REACHED 🚨🚨\n\n"
+                    f"Total Loss: ${current_loss:.2f}\n"
+                    f"Limit: ${max_loss:.2f} ({max_percent}%)\n\n"
+                    f"⛔ TRADING STOPPED PERMANENTLY\n"
+                    f"Manual reset required to resume trading.\n\n"
+                    f"Please review your trading strategy."
+                )
+            else:
+                message = (
+                    f"🚨 DAILY LOSS LIMIT REACHED 🚨\n\n"
+                    f"Daily Loss: ${current_loss:.2f}\n"
+                    f"Limit: ${max_loss:.2f} ({max_percent}%)\n\n"
+                    f"⛔ TRADING STOPPED FOR TODAY\n"
+                    f"Will resume tomorrow automatically."
+                )
+
+            await self.bot.telegram.send_message(message)
+        except Exception as e:
+            logger.error(f"Failed to send critical alert: {e}")
+
+    # ------------------------------------------------------------------
+    # Emergency close notification
+    # ------------------------------------------------------------------
+    async def send_emergency_close_result(
+        self,
+        closed_count: int,
+        failed_tickets: list,
+    ):
+        """Send notification after emergency close attempt."""
+        try:
+            if failed_tickets:
+                await self.bot.telegram.send_message(
+                    f"🚨 EMERGENCY CLOSE FAILED!\n\n"
+                    f"Failed tickets: {failed_tickets}\n"
+                    f"Please close manually!"
+                )
+            else:
+                await self.bot.telegram.send_message(
+                    f"🚨 EMERGENCY CLOSE COMPLETE\n\n"
+                    f"Closed {closed_count} positions due to flash crash detection"
+                )
+        except Exception:
+            pass  # Don't let telegram failure stop us
+
+    async def send_flash_crash_critical(self, move_pct: float, error):
+        """Send critical alert when flash crash emergency close fails."""
+        try:
+            await self.bot.telegram.send_message(
+                f"🚨🚨 CRITICAL ERROR 🚨🚨\n\n"
+                f"Flash crash detected but emergency close FAILED!\n"
+                f"Error: {error}\n\n"
+                f"MANUAL INTERVENTION REQUIRED!"
+            )
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # Market update (on-demand via command, not auto-sent)
+    # ------------------------------------------------------------------
+    async def send_market_update(self, df, regime_state, ml_prediction):
+        """Send market update to Telegram."""
+        bot = self.bot
+        try:
+            now = datetime.now()
+
+            if bot._last_market_update_time:
+                time_since = (now - bot._last_market_update_time).total_seconds()
+                if time_since < 1800:
+                    return
+
+            session_status = bot.session_filter.get_status_report()
+
+            atr = df["atr"].tail(1).item() if "atr" in df.columns else 0
+            tick = bot.mt5.get_tick(bot.config.symbol)
+            spread = (tick.ask - tick.bid) if tick else 0
+
+            if "ema_9" in df.columns and "ema_21" in df.columns:
+                ema_9 = df["ema_9"].tail(1).item()
+                ema_21 = df["ema_21"].tail(1).item()
+                trend_direction = "UPTREND" if ema_9 > ema_21 else "DOWNTREND"
+            else:
+                trend_direction = "NEUTRAL"
+
+            ctx = {
+                "h1_bias": getattr(bot, "_h1_bias_cache", "NEUTRAL"),
+                "dynamic_threshold": getattr(bot, "_last_dynamic_threshold", 0.55),
+                "market_quality": getattr(bot, "_last_market_quality", "unknown"),
+                "market_score": getattr(bot, "_last_market_score", 0),
+                "smc_signal": getattr(bot, "_last_raw_smc_signal", ""),
+                "smc_confidence": getattr(bot, "_last_raw_smc_confidence", 0),
+                "consecutive_losses": bot.smart_risk.get_state().consecutive_losses,
+                "risk_mode": bot.smart_risk.get_trading_recommendation().get("mode", "normal"),
+                "daily_loss": bot.smart_risk.get_state().daily_loss,
+                "session_trades": bot._total_session_trades,
+                "session_profit": bot._total_session_profit,
+            }
+
+            await bot.telegram.notify_market_update(
+                symbol=bot.config.symbol,
+                price=df["close"].tail(1).item(),
+                regime=regime_state.regime.value if regime_state else "unknown",
+                volatility=session_status.get("volatility", "unknown"),
+                ml_signal=ml_prediction.signal,
+                ml_confidence=ml_prediction.confidence,
+                trend_direction=trend_direction,
+                session=session_status.get("current_session", "Unknown"),
+                can_trade=session_status.get("can_trade", True),
+                atr=atr,
+                spread=spread,
+                context=ctx,
+            )
+
+            bot._last_market_update_time = now
+            logger.info("Telegram: Market update sent")
+
+        except Exception as e:
+            logger.warning(f"Failed to send market update: {e}")
+
+    # ------------------------------------------------------------------
+    # Daily summary
+    # ------------------------------------------------------------------
+    async def send_daily_summary(self):
+        """Send daily trading summary to Telegram."""
+        bot = self.bot
+        try:
+            balance = bot.mt5.account_balance or bot.config.capital
+            await bot.telegram.send_daily_summary(
+                start_balance=bot._daily_start_balance,
+                end_balance=balance,
+            )
+            logger.info("Telegram: Daily summary sent")
+        except Exception as e:
+            logger.warning(f"Failed to send daily summary: {e}")
+
+    # ------------------------------------------------------------------
+    # Hourly analysis report
+    # ------------------------------------------------------------------
+    async def send_hourly_analysis_if_due(
+        self,
+        df,
+        regime_state,
+        ml_prediction,
+        open_positions,
+        current_price: float,
+    ):
+        """Send comprehensive hourly analysis report. Interval: 1 hour."""
+        bot = self.bot
+        now = datetime.now()
+
+        if bot._last_hourly_report_time:
+            time_since = (now - bot._last_hourly_report_time).total_seconds()
+            if time_since < 3600:
+                return
+
+        try:
+            balance = bot.mt5.account_balance or bot.config.capital
+            equity = bot.mt5.account_equity or bot.config.capital
+            floating_pnl = equity - balance
+
+            # Position details with Smart Risk data
+            position_details = []
+            for row in open_positions.iter_rows(named=True):
+                ticket = row["ticket"]
+                profit = row.get("profit", 0)
+                position_type = row.get("type", 0)
+                direction = "BUY" if position_type == 0 else "SELL"
+
+                guard = bot.smart_risk._position_guards.get(ticket)
+                momentum = guard.momentum_score if guard else 0
+                tp_prob = guard.get_tp_probability() if guard else 50
+
+                position_details.append({
+                    "ticket": ticket,
+                    "direction": direction,
+                    "profit": profit,
+                    "momentum": momentum,
+                    "tp_probability": tp_prob,
+                })
+
+            session_status = bot.session_filter.get_status_report()
+
+            market_analysis = bot.dynamic_confidence.analyze_market(
+                session=session_status.get("current_session", "Unknown"),
+                regime=regime_state.regime.value if regime_state else "unknown",
+                volatility=session_status.get("volatility", "medium"),
+                trend_direction=regime_state.regime.value if regime_state else "neutral",
+                has_smc_signal=False,
+                ml_signal=ml_prediction.signal,
+                ml_confidence=ml_prediction.confidence,
+            )
+
+            risk_rec = bot.smart_risk.get_trading_recommendation()
+
+            avg_exec = (
+                (sum(bot._execution_times) / len(bot._execution_times) * 1000)
+                if bot._execution_times
+                else 0
+            )
+            uptime = (now - bot._start_time).total_seconds() / 3600
+
+            # Get ATR and spread
+            atr = 0
+            spread = 0
+            try:
+                df_latest = bot.mt5.get_market_data(
+                    symbol=bot.config.symbol,
+                    timeframe=bot.config.execution_timeframe,
+                    count=50,
+                )
+                if len(df_latest) > 0 and "atr" in df_latest.columns:
+                    atr = df_latest["atr"].tail(1).item()
+                tick = bot.mt5.get_tick(bot.config.symbol)
+                spread = (tick.ask - tick.bid) if tick else 0
+            except Exception:
+                pass
+
+            ctx = {
+                "h1_bias": getattr(bot, "_h1_bias_cache", "NEUTRAL"),
+                "smc_signal": getattr(bot, "_last_raw_smc_signal", ""),
+                "smc_confidence": getattr(bot, "_last_raw_smc_confidence", 0),
+                "atr": atr,
+                "spread": spread,
+                "total_loss": bot.smart_risk._total_loss,
+                "consecutive_losses": bot.smart_risk.get_state().consecutive_losses,
+                "entry_filters": getattr(bot, "_last_filter_results", []),
+            }
+
+            await bot.telegram.send_hourly_analysis(
+                balance=balance,
+                equity=equity,
+                floating_pnl=floating_pnl,
+                open_positions=len(open_positions),
+                position_details=position_details,
+                symbol=bot.config.symbol,
+                current_price=current_price,
+                session=session_status.get("current_session", "Unknown"),
+                regime=regime_state.regime.value if regime_state else "unknown",
+                volatility=session_status.get("volatility", "unknown"),
+                ml_signal=ml_prediction.signal,
+                ml_confidence=ml_prediction.confidence,
+                dynamic_threshold=market_analysis.confidence_threshold,
+                market_quality=market_analysis.quality.value,
+                market_score=market_analysis.score,
+                daily_pnl=bot._total_session_profit,
+                daily_trades=bot._total_session_trades,
+                risk_mode=risk_rec.get("mode", "normal"),
+                max_daily_loss=bot.smart_risk.max_daily_loss_usd,
+                uptime_hours=uptime,
+                total_loops=bot._loop_count,
+                avg_execution_ms=avg_exec,
+                news_status="DISABLED",
+                news_reason="News agent disabled",
+                context=ctx,
+            )
+
+            bot._last_hourly_report_time = now
+            logger.info("Telegram: Hourly analysis report sent")
+
+        except Exception as e:
+            logger.warning(f"Failed to send hourly analysis: {e}")
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+    def _build_close_context(self, exit_reason: str) -> dict:
+        """Build context dict for trade close notifications."""
+        bot = self.bot
+        risk_state = bot.smart_risk.get_state()
+        win_rate = (
+            (bot._total_session_wins / bot._total_session_trades * 100)
+            if bot._total_session_trades > 0
+            else 0
         )
-
-    @staticmethod
-    def format_risk_alert(
-        alert_type: str,
-        current_value: float,
-        threshold: float,
-    ) -> str:
-        """Format a risk limit breach notification.
-
-        Args:
-            alert_type: What limit was breached (e.g. 'Daily Loss').
-            current_value: Current value that breached the limit.
-            threshold: The configured limit value.
-
-        Returns:
-            HTML-formatted risk alert.
-        """
-        return (
-            "🚨 <b>Risk Alert</b>\n"
-            "━━━━━━━━━━━━━━━\n"
-            f"Limit:   <b>{alert_type}</b>\n"
-            f"Current: <b>{current_value:.2%}</b>\n"
-            f"Limit:   <b>{threshold:.2%}</b>\n"
-            "Trading suspended for this session.\n"
-        )
+        return {
+            "exit_reason": exit_reason,
+            "risk_mode": bot.smart_risk.get_trading_recommendation().get("mode", "normal"),
+            "daily_loss": risk_state.daily_loss,
+            "daily_profit": risk_state.daily_profit,
+            "consecutive_losses": risk_state.consecutive_losses,
+            "total_loss": bot.smart_risk._total_loss,
+            "session_trades": bot._total_session_trades,
+            "session_wins": bot._total_session_wins,
+            "session_profit": bot._total_session_profit,
+            "win_rate": win_rate,
+            "session": bot.session_filter.get_status_report().get("current_session", "Unknown"),
+        }
