@@ -782,13 +782,20 @@ class SMCAnalyzer:
         else:
             atr = 12.0  # Default realistic ATR for XAUUSD
 
-        # SL: 1.5-2 ATR distance (protects against noise)
-        min_sl_distance = 1.5 * atr
+        # Dynamic SL: use 2.0 ATR for better protection, with minimum floor
+        # This prevents SL from being too tight in low-volatility periods
+        min_sl_distance = max(2.0 * atr, 20.0)  # At least 20 points minimum floor for XAUUSD (prevents overly tight SL)
+        logger.debug(f"Dynamic SL distance: {min_sl_distance:.2f} (ATR={atr:.2f}, 2.0x)")
 
-        # === FIXED RR RATIO 1:1.5 ===
-        # Based on backtest analysis: RR 1:2 only hits TP 14% of the time
-        # RR 1:1.5 is more realistic for higher hit rate
-        min_rr_ratio = 1.5
+        # Dynamic RR based on market conditions (replaces fixed 1.5)
+        min_rr_ratio = self._calculate_dynamic_rr(
+            market_structure=market_structure,
+            has_bullish_break=has_bullish_break,
+            has_bearish_break=has_bearish_break,
+            has_fvg=(has_bullish_fvg or has_bearish_fvg),
+            has_ob=(has_bullish_ob or has_bearish_ob),
+            df=df,
+        )
 
         # BULLISH SIGNAL CONDITIONS
         # Need: bullish structure OR recent bullish break, AND (FVG OR OB)

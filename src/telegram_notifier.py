@@ -1279,7 +1279,7 @@ Day Change:    {((end_balance-start_balance)/start_balance*100):+.2f}%
 ⏰ {now.strftime('%Y-%m-%d %H:%M')} WIB"""
 
         await self.send_message(msg.strip(), disable_notification=True)
-        logger.info("Telegram: Hourly analysis report sent")
+        # Note: caller (telegram_notifications.py) logs the success message
 
     async def send_shutdown_message(
         self,
