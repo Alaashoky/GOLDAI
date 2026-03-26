@@ -142,8 +142,9 @@ def build_h1_bias_table(df_h1: pl.DataFrame) -> pl.DataFrame:
             "candles": _count_candle_bias_row(closes, opens),
         }
 
-        # Use balanced weights (no live regime available in backtest)
-        weights = _get_regime_weights_static("medium_volatility")
+        # Use actual regime from HMM if available, otherwise balanced weights
+        regime_str = row.get("regime_name", "medium_volatility")
+        weights = _get_regime_weights_static(regime_str)
         score = sum(signals[k] * weights[k] for k in signals)
 
         if score >= 0.3:
@@ -306,6 +307,7 @@ def run_backtest(
     lot_size: float = 0.01,
     initial_balance: float = 439.0,
     confidence_threshold: float = 0.65,
+    cooldown_bars: int = 1,
 ) -> Dict:
     """
     Run a single-pass backtest over the provided DataFrame.
@@ -332,8 +334,10 @@ def run_backtest(
     closes = df["close"].to_list()
     highs = df["high"].to_list()
     lows = df["low"].to_list()
+    atrs = df["atr"].to_list() if "atr" in df.columns else [None] * n_bars
 
     WARMUP = 100  # bars needed for indicators to stabilise
+    last_close_bar: int = -cooldown_bars  # tracks when the last trade closed
 
     for i in range(WARMUP, n_bars):
         bar_time = times[i]
@@ -347,27 +351,29 @@ def run_backtest(
         if active_trade is not None:
             t = active_trade
             risk = abs(t.entry - t.sl)
-            atr_for_trail = risk  # Approximate ATR as risk distance
+            # Use actual ATR from pre-calculated data; fall back to risk distance
+            atr_raw = atrs[i]
+            atr_for_trail = atr_raw if (atr_raw is not None and atr_raw > 0) else risk
 
             # --- Trailing stop ---
             if use_trailing and t.trailing_active:
                 if t.direction == "BUY":
-                    new_trail = close - 1.5 * atr_for_trail
+                    new_trail = high - 1.5 * atr_for_trail
                     if new_trail > t.trailing_sl:
                         t.trailing_sl = new_trail
                 else:
-                    new_trail = close + 1.5 * atr_for_trail
+                    new_trail = low + 1.5 * atr_for_trail
                     if new_trail < t.trailing_sl:
                         t.trailing_sl = new_trail
 
-            # Activate trailing after 1 ATR profit
+            # Activate trailing after 1 ATR profit (use high/low for BUY/SELL)
             if use_trailing and not t.trailing_active:
-                if t.direction == "BUY" and close >= t.entry + atr_for_trail:
+                if t.direction == "BUY" and high >= t.entry + atr_for_trail:
                     t.trailing_active = True
-                    t.trailing_sl = close - 1.5 * atr_for_trail
-                elif t.direction == "SELL" and close <= t.entry - atr_for_trail:
+                    t.trailing_sl = high - 1.5 * atr_for_trail
+                elif t.direction == "SELL" and low <= t.entry - atr_for_trail:
                     t.trailing_active = True
-                    t.trailing_sl = close + 1.5 * atr_for_trail
+                    t.trailing_sl = low + 1.5 * atr_for_trail
 
             effective_sl = t.trailing_sl if t.trailing_active else t.sl
 
@@ -409,6 +415,7 @@ def run_backtest(
                 t.result = "loss" if t.pnl < 0 else "win"
                 trades.append(t)
                 active_trade = None
+                last_close_bar = i
 
                 # Zone Guard: record loss zone
                 if t.result == "loss":
@@ -438,6 +445,7 @@ def run_backtest(
                 t.result = "win"
                 trades.append(t)
                 active_trade = None
+                last_close_bar = i
                 equity_curve.append(balance)
                 continue
 
@@ -448,6 +456,10 @@ def run_backtest(
         # No active trade — look for a new signal
         # ----------------------------------------------------------------
         equity_curve.append(balance)
+
+        # Trade cooldown: prevent immediate re-entry after closing a trade
+        if i - last_close_bar < cooldown_bars:
+            continue
 
         # Session filter
         if use_session and bar_time is not None:
@@ -473,7 +485,7 @@ def run_backtest(
         # ML filter
         if use_ml and model is not None and model.fitted:
             try:
-                pred = model.predict(df_window)
+                pred = model.predict(df_window, feature_cols)
                 if pred.signal == "HOLD":
                     continue
                 if pred.signal != signal.signal_type:
@@ -1057,6 +1069,8 @@ def main() -> None:
     use_trailing = not args.no_trailing
     use_partial = not args.no_partial
     use_session = not args.no_session
+    # Live bot uses 300s cooldown; M15 bars = 900s each → always 1 bar minimum
+    cooldown_bars = 1
 
     if not args.v3_only:
         print("  → Pass A: V2 (old logic — no H1 blocker, no zone guard, raw SMC SL/TP) ...")
@@ -1078,6 +1092,7 @@ def main() -> None:
             lot_size=args.lot,
             initial_balance=args.balance,
             confidence_threshold=args.confidence,
+            cooldown_bars=cooldown_bars,
         )
         print(f"     Trades: {v2_result['total_trades']} | "
               f"Win: {v2_result['win_rate']:.1f}% | "
@@ -1104,6 +1119,7 @@ def main() -> None:
             lot_size=args.lot,
             initial_balance=args.balance,
             confidence_threshold=args.confidence,
+            cooldown_bars=cooldown_bars,
         )
         print(f"     Trades: {v3_result['total_trades']} | "
               f"Win: {v3_result['win_rate']:.1f}% | "
