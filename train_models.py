@@ -125,7 +125,7 @@ def prepare_features(df: pl.DataFrame) -> pl.DataFrame:
     df = fe.calculate_all(df, include_ml_features=True)
     smc = SMCAnalyzer(swing_length=5)
     df = smc.calculate_all(df)
-    df = fe.create_target(df, lookahead=1)
+    df = fe.create_target(df, lookahead=4, threshold=0.0001)
     logger.info(f"Feature columns created: {len(df.columns)}")
     return df
 
@@ -362,12 +362,18 @@ def main() -> None:
         # ------------------------------------------------------------------
         logger.info("Preparing features for TRAINING window ...")
         df_train = prepare_features(df_train_raw)
+        if "target" in df_train.columns:
+            target_counts = df_train.group_by("target").len()
+            logger.info(f"Train target distribution: {target_counts}")
 
         # ------------------------------------------------------------------
         # Feature engineering on validation data
         # ------------------------------------------------------------------
         logger.info("Preparing features for VALIDATION window ...")
         df_val = prepare_features(df_val_raw)
+        if "target" in df_val.columns:
+            target_counts = df_val.group_by("target").len()
+            logger.info(f"Val target distribution: {target_counts}")
 
         # ------------------------------------------------------------------
         # Save combined training+validation data for reference
