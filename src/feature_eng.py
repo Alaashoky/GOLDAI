@@ -750,6 +750,7 @@ class FeatureEngineer:
         tp_atr_mult: float = 1.5,
         sl_atr_mult: float = 2.0,
         use_smc_aware: bool = True,
+        drop_no_setup: bool = False,
     ) -> pl.DataFrame:
         """
         Create target variable for ML training.
@@ -776,6 +777,10 @@ class FeatureEngineer:
             sl_atr_mult: ATR multiplier for SL in SMC-aware mode (unused in
                          labelling but logged for reference)
             use_smc_aware: Use SMC-context labelling (recommended)
+            drop_no_setup: When True (and use_smc_aware=True), rows where
+                           target IS NULL are dropped before returning.
+                           Default False keeps the full time series intact so
+                           callers such as fit() can handle filtering themselves.
 
         Returns:
             DataFrame with 'target' and 'target_return' columns added
@@ -860,6 +865,12 @@ class FeatureEngineer:
             )
 
         df = df.drop(["_future_close"])
+
+        if use_smc_aware and drop_no_setup:
+            before = len(df)
+            df = df.filter(pl.col("target").is_not_null())
+            logger.info(f"drop_no_setup: kept {len(df)}/{before} labelled bars")
+
         return df
     
     def get_feature_columns(self, df: pl.DataFrame) -> List[str]:

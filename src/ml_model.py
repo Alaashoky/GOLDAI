@@ -498,6 +498,7 @@ class TradingModel:
         test_window: int = 100,
         step: int = 50,
         min_test_samples: int = 10,
+        min_train_samples: int = 50,
     ) -> List[Tuple[float, float]]:
         """
         Walk-forward optimization and validation.
@@ -517,6 +518,8 @@ class TradingModel:
             step: Step size between fold starts
             min_test_samples: Minimum number of labelled test rows required;
                               folds with fewer are skipped.
+            min_train_samples: Minimum number of labelled train rows required
+                               after NaN filtering; folds with fewer are skipped.
 
         Returns:
             List of (train_auc, test_auc) tuples for each valid fold.
@@ -552,12 +555,23 @@ class TradingModel:
             X_test  = test_df.select(available_features).to_numpy()
             y_test  = test_df.select(target_col).to_numpy().ravel()
 
-            X_train = np.nan_to_num(X_train, nan=0.0)
-            X_test  = np.nan_to_num(X_test,  nan=0.0)
+            # ── Filter out NaN labels BEFORE building DMatrix ───────────────────
+            # target may be null for bars without a clear SMC setup (SMC-aware mode)
+            train_mask = ~np.isnan(y_train)
+            test_mask  = ~np.isnan(y_test)
+
+            X_train_clean = X_train[train_mask]
+            y_train_clean = y_train[train_mask].astype(float)
+            X_test_clean  = X_test[test_mask]
+            y_test_clean  = y_test[test_mask].astype(float)
+
+            # Replace NaN/inf in features AFTER label filtering
+            X_train_clean = np.nan_to_num(X_train_clean, nan=0.0, posinf=0.0, neginf=0.0)
+            X_test_clean  = np.nan_to_num(X_test_clean,  nan=0.0, posinf=0.0, neginf=0.0)
 
             # Skip folds where test set has too few samples or only one class
-            unique_test = np.unique(y_test[~np.isnan(y_test)])
-            labelled_count = int(np.sum(~np.isnan(y_test)))
+            unique_test    = np.unique(y_test_clean)
+            labelled_count = len(y_test_clean)
             if labelled_count < min_test_samples or len(unique_test) < 2:
                 logger.debug(
                     f"Walk-forward fold start={start}: skipped "
@@ -565,8 +579,17 @@ class TradingModel:
                 )
                 continue
 
-            dtrain = xgb.DMatrix(X_train, label=y_train, feature_names=available_features)
-            dtest  = xgb.DMatrix(X_test,  label=y_test,  feature_names=available_features)
+            # Also skip if train set collapsed to single class after filtering
+            unique_train = np.unique(y_train_clean)
+            if len(unique_train) < 2 or len(y_train_clean) < min_train_samples:
+                logger.debug(
+                    f"Walk-forward fold start={start}: skipped "
+                    f"(train labelled={len(y_train_clean)}, classes={len(unique_train)})"
+                )
+                continue
+
+            dtrain = xgb.DMatrix(X_train_clean, label=y_train_clean, feature_names=available_features)
+            dtest  = xgb.DMatrix(X_test_clean,  label=y_test_clean,  feature_names=available_features)
 
             train_auc = self._evaluate(dtrain)
             test_auc  = self._evaluate(dtest)
@@ -620,7 +643,6 @@ def get_default_feature_columns() -> List[str]:
         "fvg_signal",
         "ob",
         "bos", "choch",
-        "market_structure",
 
         # ── NEW: SMC context features (quality / strength) ────────────────
         "bos_count_20",          # rolling BOS count → trend strength
