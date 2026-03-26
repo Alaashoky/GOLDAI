@@ -125,7 +125,7 @@ def prepare_features(df: pl.DataFrame) -> pl.DataFrame:
     df = fe.calculate_all(df, include_ml_features=True)
     smc = SMCAnalyzer(swing_length=5)
     df = smc.calculate_all(df)
-    df = fe.create_target(df, lookahead=4, threshold=0.0001)
+    df = fe.create_target(df, lookahead=8, threshold=0.0003)
     logger.info(f"Feature columns created: {len(df.columns)}")
     return df
 
@@ -224,8 +224,8 @@ def train_xgboost_model(
         # Walk-forward validation within the training window only
         total_bars = len(df_train)
         train_window = max(500, total_bars // 20)
-        test_window  = max(50,  total_bars // 200)
-        step         = max(50,  total_bars // 200)
+        test_window  = max(100, total_bars // 100)
+        step         = max(100, total_bars // 100)
 
         logger.info("Running walk-forward validation (training split only) ...")
         available_train = [f for f in default_features if f in df_train.columns]

@@ -123,45 +123,51 @@ class TradingModel:
             logger.error(f"Target column '{target_col}' not found")
             return self
         
-        # Capture cutoff date from the full df (before drop_nulls) while 'time' is still present
+        # Capture cutoff date
         if "time" in df.columns:
             self.train_cutoff_date = df["time"].max()
         else:
             self.train_cutoff_date = None
 
-        df_clean = df.select(available_features + [target_col]).drop_nulls()
-        
-        if len(df_clean) < 100:
-            logger.warning(f"Insufficient data for training: {len(df_clean)} samples")
+        # --- FIX: Split FIRST, then drop_nulls on each part separately ---
+        # Compute split index on the raw df (before dropping nulls)
+        split_idx_raw = int(len(df) * train_ratio)
+
+        df_train_part = df.slice(0, split_idx_raw)
+        df_test_part  = df.slice(split_idx_raw)
+
+        # Clean each part independently
+        cols_needed = [c for c in available_features + [target_col] if c in df.columns]
+        df_train_clean = df_train_part.select(cols_needed).drop_nulls()
+        df_test_clean  = df_test_part.select(cols_needed).drop_nulls()
+
+        logger.info(
+            f"After split+drop_nulls — train: {len(df_train_clean)} rows, "
+            f"test: {len(df_test_clean)} rows "
+            f"(raw split at index {split_idx_raw} of {len(df)})"
+        )
+
+        if len(df_train_clean) < 100:
+            logger.warning(f"Insufficient training data after drop_nulls: {len(df_train_clean)} samples")
             return self
-        
+
+        if len(df_test_clean) < 10:
+            logger.warning(f"Test set too small after drop_nulls: {len(df_test_clean)} samples. Using last 10% of train for eval.")
+            # Fallback: use last 10% of train as test
+            fallback_n = max(50, len(df_train_clean) // 10)
+            df_test_clean  = df_train_clean.tail(fallback_n)
+            df_train_clean = df_train_clean.head(len(df_train_clean) - fallback_n)
+
         self.feature_names = available_features
-        
-        # Extract features and target
-        X = df_clean.select(available_features).to_numpy()
-        y = df_clean.select(target_col).to_numpy().ravel()
-        
-        # Handle any NaN/inf
-        X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
-        
-        # Train/test split (time-series aware - no shuffle)
-        # FIX: Add GAP between train and test to prevent temporal leakage
-        # Gap of 50 bars (~12.5 hours on M15) breaks autocorrelation
-        gap_size = 50
-        split_idx = int(len(X) * train_ratio)
 
-        X_train = X[:split_idx]
-        y_train = y[:split_idx]
-        # Skip 'gap_size' bars between train and test
-        test_start_idx = split_idx + gap_size
-        if test_start_idx >= len(X):
-            # Not enough data for gap, use smaller gap
-            test_start_idx = min(split_idx + 10, len(X) - 1)
-        X_test = X[test_start_idx:]
-        y_test = y[test_start_idx:]
+        X_train = df_train_clean.select(available_features).to_numpy()
+        y_train = df_train_clean.select(target_col).to_numpy().ravel()
+        X_test  = df_test_clean.select(available_features).to_numpy()
+        y_test  = df_test_clean.select(target_col).to_numpy().ravel()
 
-        logger.info(f"Train/Test gap: {test_start_idx - split_idx} bars to prevent temporal leakage")
-        
+        X_train = np.nan_to_num(X_train, nan=0.0, posinf=0.0, neginf=0.0)
+        X_test  = np.nan_to_num(X_test,  nan=0.0, posinf=0.0, neginf=0.0)
+
         logger.info(f"Training with {len(X_train)} samples, testing with {len(X_test)} samples")
 
         # Log target distribution for debugging
@@ -173,9 +179,27 @@ class TradingModel:
         if len(unique_test) < 2:
             logger.warning(
                 "⚠ Test set has only ONE class — AUC will be undefined! "
-                "Consider increasing lookahead or adjusting threshold."
+                "Returning 0.5 without training."
             )
-        
+            return self
+
+        # Compute class imbalance weight and inject into params for this run
+        n_neg = np.sum(y_train == 0)
+        n_pos = np.sum(y_train == 1)
+        if n_pos > 0 and n_neg > 0:
+            scale_pos_weight = float(n_neg) / float(n_pos)
+            if scale_pos_weight > 100.0:
+                logger.warning(f"scale_pos_weight={scale_pos_weight:.1f} is very large (>100); capping at 100 to stabilise training")
+                scale_pos_weight = 100.0
+            logger.info(f"Class balance: {n_neg} neg / {n_pos} pos → scale_pos_weight={scale_pos_weight:.2f}")
+        else:
+            scale_pos_weight = 1.0
+            logger.warning("Could not compute scale_pos_weight (missing class), using 1.0")
+
+        # Use a copy of params to avoid mutating the stored default
+        run_params = dict(self.params)
+        run_params["scale_pos_weight"] = scale_pos_weight
+
         # Create DMatrix
         dtrain = xgb.DMatrix(X_train, label=y_train, feature_names=available_features)
         dtest = xgb.DMatrix(X_test, label=y_test, feature_names=available_features)
@@ -184,7 +208,7 @@ class TradingModel:
         evals = [(dtrain, "train"), (dtest, "eval")]
         
         self.model = xgb.train(
-            self.params,
+            run_params,
             dtrain,
             num_boost_round=num_boost_round,
             evals=evals,
@@ -211,7 +235,7 @@ class TradingModel:
             "test_samples": len(X_test),
             "num_features": len(available_features),
             "train_cutoff_date": self.train_cutoff_date,
-            "train_bars": len(df_clean),
+            "train_bars": len(df_train_clean) + len(df_test_clean),
         }
         
         logger.info(f"Training complete: Train AUC={train_auc:.4f}, Test AUC={test_auc:.4f}")
@@ -491,7 +515,7 @@ class TradingModel:
                 feature_cols,
                 target_col,
                 train_ratio=1.0,
-                num_boost_round=50,
+                num_boost_round=100,
                 early_stopping_rounds=None,
             )
             
