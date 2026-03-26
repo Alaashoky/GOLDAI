@@ -134,7 +134,7 @@ class TradingBot:
 
         # Initialize ML Model (unified path — auto-trainer saves here after retrain)
         self.ml_model = TradingModelV2(
-            confidence_threshold=0.60,  # Binary confidence threshold (adjustable 0.55-0.65)
+            confidence_threshold=0.70,  # Binary confidence threshold raised to 0.70
             model_path="models/xgboost_model.pkl",
         )
         self.fe_v2 = MLV2FeatureEngineer()
