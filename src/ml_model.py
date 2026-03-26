@@ -163,6 +163,18 @@ class TradingModel:
         logger.info(f"Train/Test gap: {test_start_idx - split_idx} bars to prevent temporal leakage")
         
         logger.info(f"Training with {len(X_train)} samples, testing with {len(X_test)} samples")
+
+        # Log target distribution for debugging
+        unique_train, counts_train = np.unique(y_train, return_counts=True)
+        unique_test, counts_test = np.unique(y_test, return_counts=True)
+        logger.info(f"Train target dist: {dict(zip(unique_train.astype(int), counts_train))}")
+        logger.info(f"Test target dist:  {dict(zip(unique_test.astype(int), counts_test))}")
+
+        if len(unique_test) < 2:
+            logger.warning(
+                "⚠ Test set has only ONE class — AUC will be undefined! "
+                "Consider increasing lookahead or adjusting threshold."
+            )
         
         # Create DMatrix
         dtrain = xgb.DMatrix(X_train, label=y_train, feature_names=available_features)
@@ -219,6 +231,16 @@ class TradingModel:
             from sklearn.metrics import roc_auc_score
             preds = self.model.predict(dmatrix)
             labels = dmatrix.get_label()
+            
+            # Check for single-class — AUC is undefined
+            unique_labels = np.unique(labels)
+            if len(unique_labels) < 2:
+                logger.warning(
+                    f"Only one class ({unique_labels}) in evaluation set "
+                    f"({len(labels)} samples) — AUC undefined, returning 0.5"
+                )
+                return 0.5
+            
             return roc_auc_score(labels, preds)
         except Exception as e:
             logger.warning(f"Evaluation error: {e}")

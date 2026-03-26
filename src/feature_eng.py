@@ -601,8 +601,8 @@ class FeatureEngineer:
     def create_target(
         self,
         df: pl.DataFrame,
-        lookahead: int = 1,
-        threshold: float = 0.0,
+        lookahead: int = 4,
+        threshold: float = 0.0001,
     ) -> pl.DataFrame:
         """
         Create target variable for ML training.
