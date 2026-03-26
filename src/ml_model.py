@@ -87,7 +87,8 @@ class TradingModel:
         self.feature_names: List[str] = []
         self.fitted = False
         self._feature_importance: Dict[str, float] = {}
-        self._train_metrics: Dict[str, float] = {}
+        self._train_metrics: Dict[str, Any] = {}
+        self.train_cutoff_date: Any = None
     
     def fit(
         self,
@@ -122,6 +123,12 @@ class TradingModel:
             logger.error(f"Target column '{target_col}' not found")
             return self
         
+        # Capture cutoff date from the full df (before drop_nulls) while 'time' is still present
+        if "time" in df.columns:
+            self.train_cutoff_date = df["time"].max()
+        else:
+            self.train_cutoff_date = None
+
         df_clean = df.select(available_features + [target_col]).drop_nulls()
         
         if len(df_clean) < 100:
@@ -191,6 +198,8 @@ class TradingModel:
             "train_samples": len(X_train),
             "test_samples": len(X_test),
             "num_features": len(available_features),
+            "train_cutoff_date": self.train_cutoff_date,
+            "train_bars": len(df_clean),
         }
         
         logger.info(f"Training complete: Train AUC={train_auc:.4f}, Test AUC={test_auc:.4f}")
@@ -382,6 +391,7 @@ class TradingModel:
             "feature_importance": self._feature_importance,
             "train_metrics": self._train_metrics,
             "fitted": self.fitted,
+            "train_cutoff_date": self.train_cutoff_date,
         }
         
         with open(save_path, "wb") as f:
@@ -415,11 +425,18 @@ class TradingModel:
             self._feature_importance = model_data.get("feature_importance", {})
             self._train_metrics = model_data.get("train_metrics", {})
             self.fitted = model_data.get("fitted", self.model is not None)
+            # Restore cutoff date — may also be embedded in train_metrics for older models
+            self.train_cutoff_date = model_data.get(
+                "train_cutoff_date",
+                self._train_metrics.get("train_cutoff_date"),
+            )
             
             logger.info(f"Model loaded from {load_path}")
             if self._train_metrics:
                 logger.info(f"  Train AUC: {self._train_metrics.get('train_auc', 'N/A')}")
                 logger.info(f"  Test AUC: {self._train_metrics.get('test_auc', 'N/A')}")
+            if self.train_cutoff_date is not None:
+                logger.info(f"  Train cutoff: {self.train_cutoff_date}")
                 
         except Exception as e:
             logger.error(f"Failed to load model: {e}")
