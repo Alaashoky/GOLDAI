@@ -963,6 +963,17 @@ def main() -> None:
             smc_h1 = SMCAnalyzer()
             df_h1_calc = features_eng_h1.calculate_all(df_h1_raw, include_ml_features=False)
             df_h1_calc = smc_h1.calculate_all(df_h1_calc)
+            # Add regime to H1 data for consistency
+            regime_detector_h1 = MarketRegimeDetector(n_regimes=3)
+            hmm_path_h1 = ROOT / "models" / "hmm_regime.pkl"
+            if hmm_path_h1.exists():
+                try:
+                    regime_detector_h1.load(str(hmm_path_h1))
+                    df_h1_calc = regime_detector_h1.predict(df_h1_calc)
+                except Exception:
+                    df_h1_calc = df_h1_calc.with_columns(pl.lit(1).alias("regime"))
+            else:
+                df_h1_calc = df_h1_calc.with_columns(pl.lit(1).alias("regime"))
             h1_table = build_h1_bias_table(df_h1_calc)
             print(f"       H1 bias table : {len(h1_table):,} rows")
         else:
@@ -983,6 +994,31 @@ def main() -> None:
     except Exception as e:
         print(f"[ERROR] Feature/SMC calculation failed: {e}")
         sys.exit(1)
+
+    # ------------------------------------------------------------------
+    # Run HMM regime detector on test data (adds `regime` column required
+    # by the ML model — get_default_feature_columns() lists it as feature #37)
+    # ------------------------------------------------------------------
+    print("       Running HMM regime detector on test data ...")
+    regime_detector = MarketRegimeDetector(n_regimes=3)
+    hmm_path = ROOT / "models" / "hmm_regime.pkl"
+    hmm_loaded = False
+    if hmm_path.exists():
+        try:
+            regime_detector.load(str(hmm_path))
+            df_test = regime_detector.predict(df_test)
+            print(f"       Regime model loaded: {hmm_path.name}")
+            hmm_loaded = True
+        except Exception as e:
+            print(f"       [WARN] Regime model load failed ({hmm_path.name}): {e}")
+
+    if not hmm_loaded:
+        print("       [WARN] HMM regime model not found — using default regime=1 (medium volatility)")
+        df_test = df_test.with_columns([
+            pl.lit(1).alias("regime"),
+            pl.lit("medium_volatility").alias("regime_name"),
+            pl.lit(1.0).alias("regime_confidence"),
+        ])
 
     # ------------------------------------------------------------------
     # Load ML model
