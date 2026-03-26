@@ -91,6 +91,8 @@ def _count_candle_bias_row(closes: List[float], opens: List[float]) -> int:
 
 def _get_regime_weights_static(regime_str: str) -> dict:
     """Get indicator weights based on regime string."""
+    if not regime_str:
+        regime_str = "medium_volatility"
     regime = regime_str.lower()
     if "low" in regime or "ranging" in regime:
         return {"ema_trend": 0.15, "ema_cross": 0.15, "rsi": 0.30, "macd": 0.25, "candles": 0.15}
@@ -143,7 +145,7 @@ def build_h1_bias_table(df_h1: pl.DataFrame) -> pl.DataFrame:
         }
 
         # Use actual regime from HMM if available, otherwise balanced weights
-        regime_str = row.get("regime_name", "medium_volatility")
+        regime_str = row.get("regime_name") or "medium_volatility"
         weights = _get_regime_weights_static(regime_str)
         score = sum(signals[k] * weights[k] for k in signals)
 

@@ -4,13 +4,14 @@ Model Training Script
 Fetches historical data from MT5 and trains all models.
 
 Usage:
-    python train_models.py
+    python train_models.py [--bars 140000] [--symbol XAUUSD] [--timeframe M15]
 
 Output:
     - models/xgboost_model.pkl
     - models/hmm_regime.pkl
 """
 
+import argparse
 import os
 import sys
 from pathlib import Path
@@ -146,14 +147,24 @@ def train_xgboost_model(
         model_path=model_path,
     )
 
-    # Train with stricter settings
+    total_bars = len(df)
+
+    # Scale walk-forward windows proportionally to data size
+    train_window = max(500, total_bars // 20)
+    test_window = max(50, total_bars // 200)
+    step = max(50, total_bars // 200)
+
+    logger.info(f"Total bars: {total_bars:,}")
+    logger.info(f"Walk-forward windows — train: {train_window}, test: {test_window}, step: {step}")
+
+    # Train with settings scaled for dataset size
     model.fit(
         df,
         available_features,
         target_col="target",
-        train_ratio=0.7,           # More test data (30% instead of 20%)
-        num_boost_round=50,        # Fewer rounds (was 100)
-        early_stopping_rounds=5,   # Earlier stopping (was 10)
+        train_ratio=0.7,              # 70% train, 30% test
+        num_boost_round=150,          # More rounds for larger dataset
+        early_stopping_rounds=15,     # Generous stopping window
     )
     
     if model.fitted:
@@ -162,15 +173,15 @@ def train_xgboost_model(
         for feat, imp in model.get_feature_importance(10).items():
             logger.info(f"  {feat}: {imp:.4f}")
         
-        # Walk-forward validation
+        # Walk-forward validation with scaled windows
         logger.info("Running walk-forward validation...")
         results = model.walk_forward_train(
             df,
             available_features,
             "target",
-            train_window=500,
-            test_window=50,
-            step=50,
+            train_window=train_window,
+            test_window=test_window,
+            step=step,
         )
         
         if results:
@@ -192,15 +203,42 @@ def save_training_data(df: pl.DataFrame, path: str = "data/training_data.parquet
 
 def main():
     """Main training pipeline."""
+    # ---------------------------------------------------------------
+    # CLI arguments
+    # ---------------------------------------------------------------
+    parser = argparse.ArgumentParser(
+        description="GOLDAI Model Training Script"
+    )
+    parser.add_argument(
+        "--bars", type=int, default=140000,
+        help="Number of M15 bars to fetch (140000 ≈ 5 years of M15 data, default: 140000)",
+    )
+    parser.add_argument(
+        "--symbol", type=str, default=None,
+        help="Trading symbol (default: from config, e.g. XAUUSD)",
+    )
+    parser.add_argument(
+        "--timeframe", type=str, default=None,
+        help="Timeframe (default: from config, e.g. M15)",
+    )
+    args = parser.parse_args()
+
     logger.info("=" * 60)
     logger.info("SMART TRADING BOT - MODEL TRAINING")
     logger.info("=" * 60)
     
     # Load config
     config = get_config()
-    logger.info(f"Symbol: {config.symbol}")
-    logger.info(f"Capital: ${config.capital:,.2f}")
-    logger.info(f"Mode: {config.capital_mode.value}")
+
+    # Override symbol/timeframe from CLI if provided
+    symbol = args.symbol or config.symbol
+    timeframe = args.timeframe or config.execution_timeframe
+
+    logger.info(f"Symbol   : {symbol}")
+    logger.info(f"Timeframe: {timeframe}")
+    logger.info(f"Bars     : {args.bars:,} (~{args.bars / (96 * 260):.1f} years of M15 data)")
+    logger.info(f"Capital  : ${config.capital:,.2f}")
+    logger.info(f"Mode     : {config.capital_mode.value}")
     
     # Connect to MT5
     logger.info("Connecting to MT5...")
@@ -230,13 +268,26 @@ def main():
         return
     
     try:
-        # Fetch data - MORE DATA for better generalization
+        # Fetch data
         df = fetch_training_data(
             connector,
-            config.symbol,
-            config.execution_timeframe,
-            bars=15000,  # Increased for better HMM regime separation
+            symbol,
+            timeframe,
+            bars=args.bars,
         )
+
+        # Training summary: date range and data statistics
+        date_min = df["time"].min()
+        date_max = df["time"].max()
+        logger.info("=" * 60)
+        logger.info("TRAINING DATA SUMMARY")
+        logger.info("=" * 60)
+        logger.info(f"  Date range : {date_min} → {date_max}")
+        logger.info(f"  Total bars : {len(df):,}")
+        logger.info(f"  Symbol     : {symbol}  Timeframe: {timeframe}")
+        if "close" in df.columns:
+            logger.info(f"  Price range: {df['close'].min():.2f} – {df['close'].max():.2f}")
+        logger.info("=" * 60)
         
         # Prepare features
         df = prepare_features(df)
@@ -258,10 +309,14 @@ def main():
         logger.info("=" * 60)
         logger.info("TRAINING COMPLETE")
         logger.info("=" * 60)
-        logger.info(f"HMM Model: {'SAVED' if hmm_model.fitted else 'FAILED'}")
+        logger.info(f"HMM Model   : {'SAVED' if hmm_model.fitted else 'FAILED'}")
         logger.info(f"XGBoost Model: {'SAVED' if xgb_model.fitted else 'FAILED'}")
-        logger.info(f"Models saved in: models/")
-        logger.info(f"Training data saved in: data/")
+        logger.info(f"Models saved in : models/")
+        logger.info(f"Training data   : data/")
+        logger.info(f"Date range      : {date_min} → {date_max}")
+        logger.info(f"Bars trained on : {len(df):,}")
+        logger.info("=" * 60)
+        logger.info("Next step: python backtests/backtest_v3.py --bars 140000 --balance 439 --lot 0.01")
         
     except Exception as e:
         logger.error(f"Training failed: {e}")
