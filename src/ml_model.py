@@ -495,98 +495,149 @@ class TradingModel:
         feature_cols: List[str],
         target_col: str = "target",
         train_window: int = 500,
-        test_window: int = 50,
-        step: int = 20,
+        test_window: int = 100,
+        step: int = 50,
+        min_test_samples: int = 10,
     ) -> List[Tuple[float, float]]:
-        """Walk-forward optimization and validation."""
+        """
+        Walk-forward optimization and validation.
+
+        Changes vs previous version:
+        - test_window default raised from 50 → 100 (more reliable AUC estimate)
+        - step default raised from 20 → 50 (fewer folds, each with more data)
+        - min_test_samples guard: skip folds where test set has < min_test_samples
+          labelled rows (avoids the single-class AUC=0.5 artefact)
+
+        Args:
+            df: Full Polars DataFrame (features + target already computed)
+            feature_cols: Feature column names
+            target_col: Name of target column
+            train_window: Number of bars per training fold
+            test_window: Number of bars per test fold
+            step: Step size between fold starts
+            min_test_samples: Minimum number of labelled test rows required;
+                              folds with fewer are skipped.
+
+        Returns:
+            List of (train_auc, test_auc) tuples for each valid fold.
+        """
         results = []
         n = len(df)
-        
+
         for start in range(0, n - train_window - test_window, step):
             train_end = start + train_window
-            test_end = train_end + test_window
-            
+            test_end  = train_end + test_window
+
             train_df = df.slice(start, train_window)
-            test_df = df.slice(train_end, test_window)
-            
+            test_df  = df.slice(train_end, test_window)
+
             # Train on this fold
             self.fit(
                 train_df,
                 feature_cols,
                 target_col,
                 train_ratio=1.0,
-                num_boost_round=100,
+                num_boost_round=50,
                 early_stopping_rounds=None,
             )
-            
+
             if not self.fitted:
                 continue
-            
-            # Evaluate
+
+            # ── Evaluate ────────────────────────────────────────────────────
             available_features = [f for f in feature_cols if f in train_df.columns]
-            
+
             X_train = train_df.select(available_features).to_numpy()
             y_train = train_df.select(target_col).to_numpy().ravel()
-            X_test = test_df.select(available_features).to_numpy()
-            y_test = test_df.select(target_col).to_numpy().ravel()
-            
+            X_test  = test_df.select(available_features).to_numpy()
+            y_test  = test_df.select(target_col).to_numpy().ravel()
+
             X_train = np.nan_to_num(X_train, nan=0.0)
-            X_test = np.nan_to_num(X_test, nan=0.0)
-            
+            X_test  = np.nan_to_num(X_test,  nan=0.0)
+
+            # Skip folds where test set has too few samples or only one class
+            unique_test = np.unique(y_test[~np.isnan(y_test)])
+            labelled_count = int(np.sum(~np.isnan(y_test)))
+            if labelled_count < min_test_samples or len(unique_test) < 2:
+                logger.debug(
+                    f"Walk-forward fold start={start}: skipped "
+                    f"(test labelled={labelled_count}, classes={len(unique_test)})"
+                )
+                continue
+
             dtrain = xgb.DMatrix(X_train, label=y_train, feature_names=available_features)
-            dtest = xgb.DMatrix(X_test, label=y_test, feature_names=available_features)
-            
+            dtest  = xgb.DMatrix(X_test,  label=y_test,  feature_names=available_features)
+
             train_auc = self._evaluate(dtrain)
-            test_auc = self._evaluate(dtest)
-            
+            test_auc  = self._evaluate(dtest)
+
             results.append((train_auc, test_auc))
-        
+
         if results:
             avg_train = np.mean([r[0] for r in results])
-            avg_test = np.mean([r[1] for r in results])
-            logger.info(f"Walk-forward: Avg Train AUC={avg_train:.4f}, Avg Test AUC={avg_test:.4f}")
-        
+            avg_test  = np.mean([r[1] for r in results])
+            overfit   = avg_train / avg_test if avg_test > 0 else float("inf")
+            logger.info(
+                f"Walk-forward: Avg Train AUC={avg_train:.4f}, "
+                f"Avg Test AUC={avg_test:.4f}, "
+                f"Overfitting ratio={overfit:.2f} "
+                f"({len(results)} valid folds)"
+            )
+        else:
+            logger.warning("Walk-forward: no valid folds produced (all skipped)")
+
         return results
 
 
 def get_default_feature_columns() -> List[str]:
     """Get default feature columns for ML model."""
     return [
-        # Technical indicators
+        # ── Technical indicators ──────────────────────────────────────────
         "rsi", "atr", "atr_percent",
         "macd", "macd_signal", "macd_histogram",
         "bb_percent_b", "bb_width",
         "ema_9", "ema_21",
-        
-        # Returns and momentum
+
+        # ── Returns and momentum ─────────────────────────────────────────
         "returns_1", "returns_5", "returns_20",
         "log_returns",
-        
-        # Volatility
+
+        # ── Volatility ───────────────────────────────────────────────────
         "volatility_20", "normalized_range", "avg_normalized_range",
-        
-        # Price position
+
+        # ── Price position ───────────────────────────────────────────────
         "price_position", "dist_from_sma_20",
-        
-        # Trend
+
+        # ── Trend ────────────────────────────────────────────────────────
         "higher_high", "lower_low",
         "hh_count_5", "ll_count_5",
-        
-        # Volume
+
+        # ── Volume ───────────────────────────────────────────────────────
         "volume_ratio", "high_volume",
-        
-        # SMC signals (numeric)
+
+        # ── SMC signals (numeric) ─────────────────────────────────────────
         "swing_high", "swing_low",
         "fvg_signal",
         "ob",
         "bos", "choch",
         "market_structure",
-        
-        # Time features
+
+        # ── NEW: SMC context features (quality / strength) ────────────────
+        "bos_count_20",          # rolling BOS count → trend strength
+        "bos_recent",            # direction of most-recent BOS
+        "choch_recent_5",        # fresh reversal signal
+        "fvg_size",              # size of FVG relative to price
+        "fvg_in_zone",           # is price currently inside FVG?
+        "ob_distance",           # distance from Order Block mid-price
+        "swing_high_count_10",   # swing highs density
+        "swing_low_count_10",    # swing lows density
+        "structure_age",         # bars since last BOS/CHoCH
+
+        # ── Time features ────────────────────────────────────────────────
         "hour", "weekday",
         "london_session", "ny_session",
-        
-        # Regime
+
+        # ── Regime ───────────────────────────────────────────────────────
         "regime",
     ]
 
