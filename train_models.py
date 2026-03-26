@@ -122,10 +122,10 @@ def prepare_features(df: pl.DataFrame) -> pl.DataFrame:
     """Apply feature engineering and SMC indicators, then create the target."""
     logger.info("Applying feature engineering + SMC indicators ...")
     fe = FeatureEngineer()
-    df = fe.calculate_all(df, include_ml_features=True)
+    df = fe.calculate_all(df, include_ml_features=True, include_smc_features=True)
     smc = SMCAnalyzer(swing_length=5)
     df = smc.calculate_all(df)
-    df = fe.create_target(df, lookahead=8, threshold=0.0003)
+    df = fe.create_target(df, lookahead=8, threshold=0.0003, use_smc_aware=True)
     logger.info(f"Feature columns created: {len(df.columns)}")
     return df
 

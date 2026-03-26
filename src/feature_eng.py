@@ -37,14 +37,16 @@ class FeatureEngineer:
         self,
         df: pl.DataFrame,
         include_ml_features: bool = True,
+        include_smc_features: bool = True,
     ) -> pl.DataFrame:
         """
         Calculate all technical indicators and features.
-        
+
         Args:
             df: Polars DataFrame with OHLCV data
             include_ml_features: Include ML-specific features
-            
+            include_smc_features: Include SMC context features (requires SMC cols)
+
         Returns:
             DataFrame with all features added
         """
@@ -54,10 +56,13 @@ class FeatureEngineer:
         df = self.calculate_bollinger_bands(df)
         df = self.calculate_ema_crossover(df)
         df = self.calculate_volume_features(df)
-        
+
         if include_ml_features:
             df = self.calculate_ml_features(df)
-        
+
+        if include_smc_features:
+            df = self.calculate_smc_features(df)
+
         return df
     
     def calculate_rsi(
@@ -597,44 +602,264 @@ class FeatureEngineer:
         
         logger.debug("ML features calculated")
         return df
-    
+
+    def calculate_smc_features(
+        self,
+        df: pl.DataFrame,
+    ) -> pl.DataFrame:
+        """
+        Calculate SMC-context features for ML model.
+
+        These features give the model richer context about the
+        quality and strength of each SMC setup — not just 0/1 signals.
+
+        Requires columns: bos, choch, fvg_signal, ob, market_structure, atr, close, high, low
+        Returns: DataFrame with additional SMC-context feature columns.
+        """
+        # ── BOS / CHoCH rolling counts ───────────────────────────────────────
+        if "bos" in df.columns:
+            df = df.with_columns([
+                # How many bullish BOS in last 20 bars (trend strength)
+                pl.col("bos")
+                    .rolling_sum(window_size=20)
+                    .alias("bos_count_20"),
+                # Most-recent BOS direction (signed, faded over distance)
+                pl.col("bos").alias("bos_recent"),
+            ])
+        else:
+            df = df.with_columns([
+                pl.lit(0).cast(pl.Int8).alias("bos_count_20"),
+                pl.lit(0).cast(pl.Int8).alias("bos_recent"),
+            ])
+
+        if "choch" in df.columns:
+            df = df.with_columns([
+                # Was there a CHoCH in the last 5 bars? (fresh reversal signal)
+                pl.col("choch")
+                    .abs()
+                    .rolling_max(window_size=5)
+                    .cast(pl.Int8)
+                    .alias("choch_recent_5"),
+            ])
+        else:
+            df = df.with_columns([
+                pl.lit(0).cast(pl.Int8).alias("choch_recent_5"),
+            ])
+
+        # ── FVG size (bigger gap = stronger imbalance) ────────────────────────
+        if all(c in df.columns for c in ["fvg_top", "fvg_bottom", "close"]):
+            df = df.with_columns([
+                ((pl.col("fvg_top") - pl.col("fvg_bottom")).abs() / pl.col("close"))
+                    .fill_nan(0)
+                    .fill_null(0)
+                    .alias("fvg_size"),
+            ])
+        elif "fvg_signal" in df.columns:
+            # fallback: proxy via ATR-normalised dummy when price levels unavailable
+            if "atr" in df.columns:
+                df = df.with_columns([
+                    (pl.col("fvg_signal").abs().cast(pl.Float64) *
+                     pl.col("atr") / pl.col("close"))
+                        .fill_nan(0).fill_null(0)
+                        .alias("fvg_size"),
+                ])
+            else:
+                df = df.with_columns([
+                    pl.col("fvg_signal").abs().cast(pl.Float64).alias("fvg_size"),
+                ])
+        else:
+            df = df.with_columns([pl.lit(0.0).alias("fvg_size")])
+
+        # ── OB distance from current price ───────────────────────────────────
+        if all(c in df.columns for c in ["ob_top", "ob_bottom", "close"]):
+            df = df.with_columns([
+                (
+                    (pl.col("close") - (pl.col("ob_top") + pl.col("ob_bottom")) / 2).abs()
+                    / pl.col("close")
+                )
+                .fill_nan(0).fill_null(0)
+                .alias("ob_distance"),
+            ])
+        else:
+            df = df.with_columns([pl.lit(0.0).alias("ob_distance")])
+
+        # ── Swing strength (how many confirming bars each swing has) ──────────
+        if "swing_high" in df.columns:
+            df = df.with_columns([
+                pl.col("swing_high")
+                    .rolling_sum(window_size=10)
+                    .alias("swing_high_count_10"),
+            ])
+        else:
+            df = df.with_columns([pl.lit(0).cast(pl.Int8).alias("swing_high_count_10")])
+
+        if "swing_low" in df.columns:
+            df = df.with_columns([
+                pl.col("swing_low")
+                    .rolling_sum(window_size=10)
+                    .alias("swing_low_count_10"),
+            ])
+        else:
+            df = df.with_columns([pl.lit(0).cast(pl.Int8).alias("swing_low_count_10")])
+
+        # ── Market structure age (bars since last BOS/CHoCH) ─────────────────
+        if "bos" in df.columns and "choch" in df.columns:
+            df = df.with_columns([
+                (pl.col("bos").abs() + pl.col("choch").abs())
+                    .cast(pl.Int8)
+                    .alias("_structure_event"),
+            ])
+            # Cumulative count reset at each event → bars since last event
+            structure_arr = df["_structure_event"].to_numpy()
+            ages = np.zeros(len(structure_arr), dtype=np.int32)
+            counter = 0
+            for i, val in enumerate(structure_arr):
+                if val != 0:
+                    counter = 0
+                else:
+                    counter += 1
+                ages[i] = counter
+            df = df.with_columns([
+                pl.Series("structure_age", ages),
+            ])
+            df = df.drop(["_structure_event"])
+        else:
+            df = df.with_columns([pl.lit(0).cast(pl.Int32).alias("structure_age")])
+
+        # ── FVG freshness: is price currently inside the FVG zone? ───────────
+        if all(c in df.columns for c in ["fvg_top", "fvg_bottom", "close"]):
+            df = df.with_columns([
+                (
+                    (pl.col("close") >= pl.col("fvg_bottom")) &
+                    (pl.col("close") <= pl.col("fvg_top"))
+                )
+                .cast(pl.Int8)
+                .alias("fvg_in_zone"),
+            ])
+        else:
+            df = df.with_columns([pl.lit(0).cast(pl.Int8).alias("fvg_in_zone")])
+
+        logger.debug("SMC context features calculated")
+        return df
+
     def create_target(
         self,
         df: pl.DataFrame,
-        lookahead: int = 4,
-        threshold: float = 0.0001,
+        lookahead: int = 8,
+        threshold: float = 0.0003,
+        tp_atr_mult: float = 1.5,
+        sl_atr_mult: float = 2.0,
+        use_smc_aware: bool = True,
     ) -> pl.DataFrame:
         """
         Create target variable for ML training.
-        
+
+        Two modes:
+        1. SMC-aware (use_smc_aware=True, default):
+           target = 1  if there is an active SMC BUY setup at bar t
+                        AND close[t + lookahead] >= close[t] + tp_atr_mult * ATR[t]
+           target = 0  if there is an active SMC SELL setup at bar t
+                        AND close[t + lookahead] <= close[t] - tp_atr_mult * ATR[t]
+           Bars without a clear setup are labelled NaN (dropped later by drop_nulls).
+
+           Requires columns: market_structure (or bos/choch), atr
+
+        2. Generic (use_smc_aware=False):
+           Identical to the previous behaviour — binary 1/0 based on a
+           simple percentage threshold.  Kept for backwards compatibility.
+
         Args:
-            df: DataFrame with price data
-            lookahead: Bars to look ahead for target
-            threshold: Minimum return threshold for positive target
-            
+            df: DataFrame with features already calculated
+            lookahead: Bars ahead to check target price
+            threshold: Generic-mode minimum return (ignored in SMC-aware mode)
+            tp_atr_mult: ATR multiplier for TP in SMC-aware mode
+            sl_atr_mult: ATR multiplier for SL in SMC-aware mode (unused in
+                         labelling but logged for reference)
+            use_smc_aware: Use SMC-context labelling (recommended)
+
         Returns:
-            DataFrame with target column
+            DataFrame with 'target' and 'target_return' columns added
         """
+        # Future close is always needed
         df = df.with_columns([
-            # Future close
             pl.col("close").shift(-lookahead).alias("_future_close"),
         ])
-        
+
         df = df.with_columns([
-            # Binary target: 1 if price goes up, 0 otherwise
-            ((pl.col("_future_close") / pl.col("close") - 1) > threshold)
-                .cast(pl.Int32)
-                .alias("target"),
-            
-            # Return target (for regression)
-            (pl.col("_future_close") / pl.col("close") - 1)
-                .alias("target_return"),
+            # Return target (for regression / diagnostics)
+            (pl.col("_future_close") / pl.col("close") - 1).alias("target_return"),
         ])
-        
-        # Drop temporary columns
+
+        if use_smc_aware and "atr" in df.columns:
+            # ── determine BUY / SELL bias from SMC structure ─────────────────
+            has_market_structure = "market_structure" in df.columns
+            has_bos = "bos" in df.columns
+            has_choch = "choch" in df.columns
+
+            if has_market_structure:
+                buy_bias  = pl.col("market_structure") > 0
+                sell_bias = pl.col("market_structure") < 0
+            elif has_bos or has_choch:
+                bos_col   = pl.col("bos")   if has_bos   else pl.lit(0)
+                choch_col = pl.col("choch") if has_choch else pl.lit(0)
+                buy_bias  = (bos_col > 0) | (choch_col > 0)
+                sell_bias = (bos_col < 0) | (choch_col < 0)
+            else:
+                # No SMC structure available — fall back to generic mode
+                logger.warning(
+                    "SMC-aware target requested but no market_structure/bos/choch columns "
+                    "found. Falling back to generic threshold-based target."
+                )
+                df = df.with_columns([
+                    (pl.col("target_return") > threshold)
+                        .cast(pl.Int32)
+                        .alias("target"),
+                ])
+                df = df.drop(["_future_close"])
+                logger.debug(
+                    f"Target created (generic fallback, lookahead={lookahead}, "
+                    f"threshold={threshold})"
+                )
+                return df
+
+            # TP distance = tp_atr_mult × ATR
+            tp_dist = pl.col("atr") * tp_atr_mult
+
+            # SMC-aware labelling:
+            #   BUY setup that hit TP  → 1
+            #   SELL setup that hit TP → 0
+            #   Anything else          → null (will be dropped by drop_nulls)
+            df = df.with_columns([
+                pl.when(buy_bias & (pl.col("_future_close") >= pl.col("close") + tp_dist))
+                    .then(pl.lit(1))
+                    .when(sell_bias & (pl.col("_future_close") <= pl.col("close") - tp_dist))
+                    .then(pl.lit(0))
+                    .otherwise(pl.lit(None))
+                    .cast(pl.Int32)
+                    .alias("target"),
+            ])
+
+            n_total    = len(df)
+            n_labelled = df["target"].drop_nulls().len()
+            n_buy      = (df["target"] == 1).sum()
+            n_sell     = (df["target"] == 0).sum()
+            logger.info(
+                f"SMC-aware target: {n_labelled}/{n_total} bars labelled "
+                f"({n_buy} BUY-wins, {n_sell} SELL-wins, "
+                f"TP_mult={tp_atr_mult}×ATR, lookahead={lookahead})"
+            )
+        else:
+            # ── Generic mode (original behaviour) ────────────────────────────
+            df = df.with_columns([
+                (pl.col("target_return") > threshold)
+                    .cast(pl.Int32)
+                    .alias("target"),
+            ])
+            logger.debug(
+                f"Target created (generic, lookahead={lookahead}, threshold={threshold})"
+            )
+
         df = df.drop(["_future_close"])
-        
-        logger.debug(f"Target created (lookahead={lookahead}, threshold={threshold})")
         return df
     
     def get_feature_columns(self, df: pl.DataFrame) -> List[str]:
