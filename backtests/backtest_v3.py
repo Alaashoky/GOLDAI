@@ -888,6 +888,15 @@ def main() -> None:
     parser.add_argument("--no-session", action="store_true", help="Disable session filter")
     parser.add_argument("--v2-only", action="store_true", help="Run V2 pass only (skip V3)")
     parser.add_argument("--v3-only", action="store_true", help="Run V3 pass only (skip V2)")
+    parser.add_argument(
+        "--retrain", action="store_true",
+        help="Train fresh models on the train split inside the backtest (zero leakage)",
+    )
+    parser.add_argument(
+        "--no-retrain", dest="retrain", action="store_false",
+        help="Use pre-trained models from models/ (legacy — may have data leakage)",
+    )
+    parser.set_defaults(retrain=True)
     args = parser.parse_args()
 
     print()
@@ -899,6 +908,7 @@ def main() -> None:
     print(f"  Lot     : {args.lot}")
     print(f"  Balance : ${args.balance:.2f}")
     print(f"  Conf.   : {args.confidence}")
+    print(f"  Mode    : {'RETRAIN (zero leakage)' if args.retrain else 'PRE-TRAINED (legacy)'}")
     print()
 
     # ------------------------------------------------------------------
@@ -958,6 +968,15 @@ def main() -> None:
     start_str = test_start.strftime("%Y-%m-%d") if hasattr(test_start, "strftime") else str(test_start)
     end_str = test_end.strftime("%Y-%m-%d") if hasattr(test_end, "strftime") else str(test_end)
     print(f"       Test period  : {start_str} → {end_str}  ({n_test:,} bars — OUT-OF-SAMPLE)")
+
+    # Also capture the train split date range for display
+    df_train_meta = df_full.slice(0, split_idx)
+    train_times = df_train_meta["time"].to_list() if "time" in df_train_meta.columns else []
+    train_start_dt = train_times[0] if train_times else None
+    train_end_dt = train_times[-1] if train_times else None
+    tr_start_str = train_start_dt.strftime("%Y-%m-%d") if hasattr(train_start_dt, "strftime") else str(train_start_dt)
+    tr_end_str = train_end_dt.strftime("%Y-%m-%d") if hasattr(train_end_dt, "strftime") else str(train_end_dt)
+    print(f"       Train period : {tr_start_str} → {tr_end_str}  ({split_idx:,} bars)")
     print()
 
     # ------------------------------------------------------------------
@@ -1010,54 +1029,161 @@ def main() -> None:
         sys.exit(1)
 
     # ------------------------------------------------------------------
-    # Run HMM regime detector on test data (adds `regime` column required
-    # by the ML model — get_default_feature_columns() lists it as feature #37)
+    # Model setup: retrain on train split (default) OR load pre-trained
     # ------------------------------------------------------------------
-    print("       Running HMM regime detector on test data ...")
-    regime_detector = MarketRegimeDetector(n_regimes=3)
-    hmm_path = ROOT / "models" / "hmm_regime.pkl"
-    hmm_loaded = False
-    if hmm_path.exists():
-        try:
-            regime_detector.load(str(hmm_path))
-            df_test = regime_detector.predict(df_test)
-            print(f"       Regime model loaded: {hmm_path.name}")
-            hmm_loaded = True
-        except Exception as e:
-            print(f"       [WARN] Regime model load failed ({hmm_path.name}): {e}")
-
-    if not hmm_loaded:
-        print("       [WARN] HMM regime model not found — using default regime=1 (medium volatility)")
-        df_test = df_test.with_columns([
-            pl.lit(1).alias("regime"),
-            pl.lit("medium_volatility").alias("regime_name"),
-            pl.lit(1.0).alias("regime_confidence"),
-        ])
-
-    # ------------------------------------------------------------------
-    # Load ML model
-    # ------------------------------------------------------------------
-    print("[4/5] Loading ML model ...")
-    model = None
     feature_cols = get_default_feature_columns()
-    model_paths = [
-        ROOT / "models" / "xgb_model.pkl",
-        ROOT / "models" / "xgboost_model.pkl",
-        ROOT / "models" / "xgboost_model.json",
-    ]
-    for mp in model_paths:
-        if mp.exists():
-            try:
-                model = TradingModel(confidence_threshold=args.confidence, model_path=str(mp))
-                model.load(str(mp))
-                print(f"       Model loaded : {mp.name}")
-                break
-            except Exception as e:
-                print(f"       [WARN] Could not load {mp.name}: {e}")
 
-    if model is None or not model.fitted:
-        print("       [WARN] No ML model loaded — ML filter will be skipped")
+    if args.retrain:
+        # ---- [2b/5] Train fresh models on TRAIN split only (zero leakage) ----
+        print("[2b/5] Training fresh models on TRAIN split only (zero leakage) ...")
+        print(f"       Train data: {tr_start_str} → {tr_end_str}  ({split_idx:,} bars)")
+
+        try:
+            df_train_bt = df_full.slice(0, split_idx)
+
+            # Calculate features on TRAIN split
+            features_eng_tr = FeatureEngineer()
+            smc_tr = SMCAnalyzer()
+            df_train_bt = features_eng_tr.calculate_all(df_train_bt, include_ml_features=True)
+            df_train_bt = smc_tr.calculate_all(df_train_bt)
+            df_train_bt = features_eng_tr.create_target(df_train_bt, lookahead=1)
+
+            # Train HMM on train split only
+            hmm_bt = MarketRegimeDetector(
+                n_regimes=3,
+                model_path=str(ROOT / "models" / "backtest_hmm.pkl"),
+            )
+            hmm_bt.fit(df_train_bt)
+
+            if hmm_bt.fitted:
+                df_train_bt = hmm_bt.predict(df_train_bt)
+                print("       HMM fitted and saved → models/backtest_hmm.pkl")
+            else:
+                print("       [WARN] HMM fit failed — adding default regime column")
+                df_train_bt = df_train_bt.with_columns([
+                    pl.lit(1).alias("regime"),
+                    pl.lit("medium_volatility").alias("regime_name"),
+                ])
+
+            # Train XGBoost on train split only
+            xgb_bt = TradingModel(
+                confidence_threshold=args.confidence,
+                model_path=str(ROOT / "models" / "backtest_xgb.pkl"),
+            )
+            feature_cols_available = [f for f in feature_cols if f in df_train_bt.columns]
+            xgb_bt.fit(
+                df_train_bt,
+                feature_cols_available,
+                "target",
+                train_ratio=0.8,
+                num_boost_round=50,
+                early_stopping_rounds=5,
+            )
+
+            if xgb_bt.fitted:
+                print("       XGBoost fitted and saved → models/backtest_xgb.pkl")
+                print(f"       Train AUC: {xgb_bt._train_metrics.get('train_auc', 'N/A')}")
+                print(f"       Test AUC:  {xgb_bt._train_metrics.get('test_auc', 'N/A')}")
+                cutoff = xgb_bt._train_metrics.get("train_cutoff_date")
+                if cutoff:
+                    print(f"       Cutoff   : {cutoff}  (model saw data UP TO this date only)")
+            else:
+                print("       [WARN] XGBoost fit failed — ML filter will be skipped")
+
+            model = xgb_bt if xgb_bt.fitted else None
+            regime_detector = hmm_bt
+
+        except Exception as e:
+            print(f"[ERROR] Retrain failed: {e}")
+            import traceback
+            traceback.print_exc()
+            model = None
+            regime_detector = MarketRegimeDetector(n_regimes=3)
+
+        # Now apply the backtest-trained HMM to the TEST data
+        print("       Running backtest HMM on test data ...")
+        hmm_loaded = False
+        if regime_detector.fitted:
+            try:
+                df_test = regime_detector.predict(df_test)
+                hmm_loaded = True
+            except Exception as e:
+                print(f"       [WARN] HMM predict on test data failed: {e}")
+
+        if not hmm_loaded:
+            df_test = df_test.with_columns([
+                pl.lit(1).alias("regime"),
+                pl.lit("medium_volatility").alias("regime_name"),
+                pl.lit(1.0).alias("regime_confidence"),
+            ])
+
+    else:
+        # ---- Legacy: load pre-trained models (may have data leakage) ----
+        print("  ⚠️  Using pre-trained models (--no-retrain) — results may have data leakage!")
+
+        print("       Running HMM regime detector on test data ...")
+        regime_detector = MarketRegimeDetector(n_regimes=3)
+        hmm_path = ROOT / "models" / "hmm_regime.pkl"
+        hmm_loaded = False
+        if hmm_path.exists():
+            try:
+                regime_detector.load(str(hmm_path))
+                df_test = regime_detector.predict(df_test)
+                print(f"       Regime model loaded: {hmm_path.name}")
+                hmm_loaded = True
+            except Exception as e:
+                print(f"       [WARN] Regime model load failed ({hmm_path.name}): {e}")
+
+        if not hmm_loaded:
+            print("       [WARN] HMM regime model not found — using default regime=1 (medium volatility)")
+            df_test = df_test.with_columns([
+                pl.lit(1).alias("regime"),
+                pl.lit("medium_volatility").alias("regime_name"),
+                pl.lit(1.0).alias("regime_confidence"),
+            ])
+
+        print("[4/5] Loading ML model ...")
         model = None
+        model_paths = [
+            ROOT / "models" / "xgb_model.pkl",
+            ROOT / "models" / "xgboost_model.pkl",
+            ROOT / "models" / "xgboost_model.json",
+        ]
+        for mp in model_paths:
+            if mp.exists():
+                try:
+                    model = TradingModel(confidence_threshold=args.confidence, model_path=str(mp))
+                    model.load(str(mp))
+                    print(f"       Model loaded : {mp.name}")
+
+                    # Leakage check
+                    cutoff = model.train_cutoff_date
+                    if cutoff is not None and test_start is not None:
+                        if cutoff >= test_start:
+                            cutoff_str = cutoff.strftime("%Y-%m-%d") if hasattr(cutoff, "strftime") else str(cutoff)
+                            print()
+                            print("  " + "⚠️ " * 15)
+                            print("  ⚠️  WARNING: DATA LEAKAGE DETECTED  ⚠️")
+                            print("  " + "⚠️ " * 15)
+                            print(f"  Model trained on data up to : {cutoff_str}")
+                            print(f"  Test period starts at       : {start_str}")
+                            print("  The model has already SEEN the test data during training!")
+                            print("  Results are INFLATED and NOT representative of live performance.")
+                            print("  Use --retrain (default) for a zero-leakage backtest.")
+                            print("  " + "⚠️ " * 15)
+                            print()
+                        else:
+                            cutoff_str = cutoff.strftime("%Y-%m-%d") if hasattr(cutoff, "strftime") else str(cutoff)
+                            print(f"       ✅ No leakage: model cutoff {cutoff_str} < test start {start_str}")
+                    else:
+                        print("       [WARN] Cannot verify leakage — model has no train_cutoff_date metadata")
+                    break
+                except Exception as e:
+                    print(f"       [WARN] Could not load {mp.name}: {e}")
+
+        if model is None or not model.fitted:
+            print("       [WARN] No ML model loaded — ML filter will be skipped")
+            model = None
 
     # ------------------------------------------------------------------
     # Run backtests

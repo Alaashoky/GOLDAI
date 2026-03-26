@@ -210,8 +210,9 @@ def main():
         description="GOLDAI Model Training Script"
     )
     parser.add_argument(
-        "--bars", type=int, default=140000,
-        help="Number of M15 bars to fetch (140000 ≈ 5 years of M15 data, default: 140000)",
+        "--bars", type=int, default=105000,
+        help="Number of M15 bars to fetch (105000 = 75% of 140K bars, default: 105000). "
+             "Reserve the most-recent 25% for backtest validation.",
     )
     parser.add_argument(
         "--symbol", type=str, default=None,
@@ -239,6 +240,7 @@ def main():
     logger.info(f"Bars     : {args.bars:,} (~{args.bars / (96 * 260):.1f} years of M15 data)")
     logger.info(f"Capital  : ${config.capital:,.2f}")
     logger.info(f"Mode     : {config.capital_mode.value}")
+    logger.info(f"Training on {args.bars:,} bars, reserving recent data for backtest validation")
     
     # Connect to MT5
     logger.info("Connecting to MT5...")
@@ -315,6 +317,10 @@ def main():
         logger.info(f"Training data   : data/")
         logger.info(f"Date range      : {date_min} → {date_max}")
         logger.info(f"Bars trained on : {len(df):,}")
+        train_cutoff = xgb_model._train_metrics.get("train_cutoff_date", date_max)
+        train_bars_clean = xgb_model._train_metrics.get("train_bars", len(df))
+        logger.info(f"Train cutoff    : {train_cutoff}")
+        logger.info(f"Clean bars used : {train_bars_clean:,}")
         logger.info("=" * 60)
         logger.info("Next step: python backtests/backtest_v3.py --bars 140000 --balance 439 --lot 0.01")
         
