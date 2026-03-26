@@ -214,6 +214,7 @@ class TradingBot:
         self._pyramid_done_tickets: set = set()  # Tickets that already triggered a pyramid
         self._last_pyramid_time: Optional[datetime] = None  # Cooldown between pyramids
         self._position_check_interval: int = 5  # Check positions every N seconds between candles (more data points for velocity)
+        self._recent_rejected_zones: list = []  # Zone guard: list of (direction, price, timestamp)
 
         # Entry filter tracking for dashboard
         self._last_filter_results: list = []
@@ -1669,10 +1670,9 @@ class TradingBot:
         if signal_blocked:
             return
 
-        # 10.1 H1 Bias — PENDUKUNG SAJA (v0.2.5d: tidak memblokir, hanya penalti confidence)
-        # SMC is MASTER. H1 aligned = boost 5%, H1 opposed = penalti 10%
+        # 10.1 H1 Bias — block trades opposing strong/moderate H1 trend
         h1_enabled = self._is_filter_enabled("h1_bias")
-        h1_passed = True  # Always pass — never block
+        h1_passed = True  # Default pass
         h1_detail = f"H1={h1_bias}"
         h1_penalty = 1.0
 
@@ -1686,23 +1686,83 @@ class TradingBot:
                 (final_signal.signal_type == "SELL" and h1_bias == "BEARISH")
             )
 
+            # Get H1 bias strength (cached from _get_h1_bias())
+            h1_strength = getattr(self, '_h1_bias_strength', 'weak')
+
             if h1_aligned:
                 h1_penalty = 1.05  # 5% confidence boost
                 h1_detail = f"Aligned {h1_bias} (+5%)"
                 logger.info(f"H1 Filter: {final_signal.signal_type} aligned with H1={h1_bias} (+5% boost)")
             elif h1_opposed:
-                h1_penalty = 0.90  # 10% confidence penalty (NOT block)
-                h1_detail = f"Opposed {h1_bias} (-10%)"
-                logger.info(f"H1 Filter: {final_signal.signal_type} opposed H1={h1_bias} (-10% penalty, NOT blocked)")
+                if h1_strength in ("strong", "moderate"):
+                    # BLOCK trade when opposing strong/moderate H1 trend
+                    h1_passed = False
+                    h1_penalty = 0.0
+                    h1_detail = f"BLOCKED: Opposed {h1_bias} ({h1_strength})"
+                    logger.warning(f"H1 Filter: {final_signal.signal_type} BLOCKED — opposed H1={h1_bias} ({h1_strength})")
+                else:
+                    # Weak H1: apply 15% penalty
+                    h1_penalty = 0.85
+                    h1_detail = f"Opposed {h1_bias} weak (-15%)"
+                    logger.info(f"H1 Filter: {final_signal.signal_type} opposed H1={h1_bias} (weak, -15% penalty)")
             else:
                 logger.debug(f"H1 Filter: NEUTRAL — no adjustment")
 
             # Apply H1 penalty to final signal confidence
-            final_signal.confidence *= h1_penalty
+            if h1_passed:
+                final_signal.confidence *= h1_penalty
 
-        self._last_filter_results.append({"name": "H1 Bias (#31B)", "passed": True, "detail": h1_detail})
+        self._last_filter_results.append({"name": "H1 Bias (#31B)", "passed": h1_passed, "detail": h1_detail})
 
-        # 10.2 Time-of-Hour Filter (#34A: skip WIB hours 9 and 21 — backtest +$356)
+        # If H1 blocked the signal, return None
+        if not h1_passed and h1_enabled:
+            return
+
+        # 10.2 DUPLICATE ZONE GUARD — prevent re-entry in same price zone after loss
+        if final_signal is not None:
+            zone_guard_enabled = True
+            if zone_guard_enabled:
+                current_price_zg = final_signal.entry_price
+                current_direction_zg = final_signal.signal_type
+                current_atr_zg = None
+                if "atr" in df.columns:
+                    current_atr_zg = df["atr"].tail(1).item()
+                zone_radius = current_atr_zg if current_atr_zg and current_atr_zg > 0 else 15.0  # 15 points default (≈1 ATR for XAUUSD)
+
+                # Clean old entries (older than 2 hours)
+                now_ts = time.time()
+                self._recent_rejected_zones = [
+                    (d, p, t) for d, p, t in self._recent_rejected_zones
+                    if now_ts - t < 7200
+                ]
+
+                # Check if same direction + same zone was recently rejected/lost
+                zone_blocked = False
+                for prev_dir, prev_price, prev_time in self._recent_rejected_zones:
+                    if prev_dir == current_direction_zg and abs(current_price_zg - prev_price) <= zone_radius:
+                        zone_blocked = True
+                        logger.info(
+                            f"Zone Guard: {current_direction_zg} @ {current_price_zg:.2f} blocked — "
+                            f"same zone as rejected {prev_dir} @ {prev_price:.2f} "
+                            f"({(now_ts - prev_time)/60:.0f}m ago)"
+                        )
+                        break
+
+                if zone_blocked:
+                    self._last_filter_results.append({
+                        "name": "Zone Guard",
+                        "passed": False,
+                        "detail": "Blocked: same zone as recent loss"
+                    })
+                    return
+
+                self._last_filter_results.append({
+                    "name": "Zone Guard",
+                    "passed": True,
+                    "detail": "OK (no recent losses in zone)"
+                })
+
+        # 10.3 Time-of-Hour Filter (#34A: skip WIB hours 9 and 21 — backtest +$356)
         # Hour 9 WIB (02:00 UTC) = end of NY session, low liquidity
         # Hour 21 WIB (14:00 UTC) = London-NY transition, whipsaw prone
         wib_hour = datetime.now(ZoneInfo("Asia/Jakarta")).hour
@@ -2458,6 +2518,16 @@ class TradingBot:
                         self.smart_risk.unregister_position(action.ticket)
                         self.position_manager._peak_profits.pop(action.ticket, None)
                         self._pyramid_done_tickets.discard(action.ticket)  # Cleanup pyramid tracking
+                        # Zone guard: record entry zone on loss
+                        if profit < 0:
+                            loss_zone_direction = "SELL"
+                            loss_zone_entry_price = current_price
+                            for r in open_positions.iter_rows(named=True):
+                                if r["ticket"] == action.ticket:
+                                    loss_zone_direction = "BUY" if r["type"] == 0 else "SELL"
+                                    loss_zone_entry_price = r.get("price_open", current_price)
+                                    break
+                            self._recent_rejected_zones.append((loss_zone_direction, loss_zone_entry_price, time.time()))
                         await self.notifications.notify_trade_close_smart(action.ticket, profit, current_price, action.reason)
                         logger.info(f"CLOSED #{action.ticket}: {action.reason}")
                         continue  # Skip SmartRiskManager eval for this ticket
@@ -2566,6 +2636,10 @@ class TradingBot:
                     risk_result = self.smart_risk.record_trade_result(profit)
                     self.smart_risk.unregister_position(ticket)
                     self._pyramid_done_tickets.discard(ticket)  # Cleanup pyramid tracking
+
+                    # Zone guard: record entry zone on loss
+                    if profit < 0:
+                        self._recent_rejected_zones.append((direction, entry_price, time.time()))
 
                     # Log trade close for auto-training
                     try:
