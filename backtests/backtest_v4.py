@@ -12,8 +12,9 @@ Date boundaries (matching train_models.py defaults):
 
 Two passes are run:
   V2 — old logic: no H1 blocker, no zone guard, raw SMC SL/TP
-  V4 — new logic: H1 Blocker + Zone Guard + Dynamic SL (2.0× ATR, min 20 pts)
-                  + Dynamic RR (1.5–2.0)
+  V4 — new logic: H1 Blocker + Zone Guard + Dynamic SL (1.2× ATR, min 12 pts)
+                  + Dynamic RR (2.0–3.0) + Breakeven Trailing + Min RR 2.0 filter
+                  + Confidence threshold 0.70
 
 Usage:
     python backtests/backtest_v4.py [options]
@@ -22,7 +23,7 @@ Usage:
       --symbol XAUUSD.m
       --lot 0.01
       --balance 439
-      --confidence 0.65
+      --confidence 0.70
       --test-start 2024-07-01
       --test-end   2026-03-26
       --train-start 2020-01-01
@@ -237,25 +238,25 @@ def calculate_dynamic_rr(
     has_ob: bool,
     df_window: pl.DataFrame,
 ) -> float:
-    """Return a dynamic RR in [1.5, 2.0] based on market conditions."""
-    rr = 1.5
+    """Return a dynamic RR in [2.0, 3.0] based on market conditions."""
+    rr = 2.0  # raised from 1.5
 
     if market_structure != 0:
-        rr += 0.15
+        rr += 0.25   # raised from 0.15
     if has_bullish_break or has_bearish_break:
-        rr += 0.10
+        rr += 0.20   # raised from 0.10
     if has_fvg:
-        rr += 0.05
+        rr += 0.15   # raised from 0.05
     if has_ob:
-        rr += 0.05
+        rr += 0.15   # raised from 0.05
 
     if "bos" in df_window.columns:
         recent_bos = df_window.tail(20)["bos"].to_list()
         bos_count  = sum(1 for b in recent_bos if b != 0)
         if bos_count >= 3:
-            rr += 0.10
+            rr += 0.25   # raised from 0.10
         elif bos_count >= 2:
-            rr += 0.05
+            rr += 0.10   # raised from 0.05
 
     if "atr" in df_window.columns:
         atr_vals = df_window.tail(1)["atr"].to_list()
@@ -272,7 +273,7 @@ def calculate_dynamic_rr(
         if bos_count_30 == 0:
             rr -= 0.10
 
-    return max(1.5, min(2.0, rr))
+    return max(2.0, min(3.0, rr))  # [2.0, 3.0] raised from [1.5, 2.0]
 
 
 # ---------------------------------------------------------------------------
@@ -333,7 +334,7 @@ def run_backtest(
     # Parameters
     lot_size:             float = 0.01,
     initial_balance:      float = 439.0,
-    confidence_threshold: float = 0.65,
+    confidence_threshold: float = 0.70,
     cooldown_bars:        int   = 1,
 ) -> Dict:
     """
@@ -381,22 +382,23 @@ def run_backtest(
             # Trailing stop update
             if use_trailing and t.trailing_active:
                 if t.direction == "BUY":
-                    new_trail = high - 1.5 * atr_trail
+                    new_trail = high - 1.0 * atr_trail
                     if new_trail > t.trailing_sl:
                         t.trailing_sl = new_trail
                 else:
-                    new_trail = low + 1.5 * atr_trail
+                    new_trail = low + 1.0 * atr_trail
                     if new_trail < t.trailing_sl:
                         t.trailing_sl = new_trail
 
-            # Activate trailing after 1 ATR in profit
+            # Activate trailing after 0.5 ATR in profit (breakeven first)
             if use_trailing and not t.trailing_active:
-                if t.direction == "BUY" and high >= t.entry + atr_trail:
+                atr_trail_trigger = 0.5 * atr_trail
+                if t.direction == "BUY" and high >= t.entry + atr_trail_trigger:
                     t.trailing_active = True
-                    t.trailing_sl     = high - 1.5 * atr_trail
-                elif t.direction == "SELL" and low <= t.entry - atr_trail:
+                    t.trailing_sl     = t.entry  # breakeven first
+                elif t.direction == "SELL" and low <= t.entry - atr_trail_trigger:
                     t.trailing_active = True
-                    t.trailing_sl     = low + 1.5 * atr_trail
+                    t.trailing_sl     = t.entry  # breakeven first
 
             effective_sl = t.trailing_sl if t.trailing_active else t.sl
 
@@ -563,7 +565,7 @@ def run_backtest(
             atr = 12.0
 
         if use_dynamic_sl:
-            min_sl_dist = max(2.0 * atr, 20.0)
+            min_sl_dist = max(1.2 * atr, 12.0)  # tightened from max(2.0 * atr, 20.0)
         else:
             raw_sl_dist = abs(entry - signal.stop_loss) if signal.stop_loss else (1.5 * atr)
             min_sl_dist = max(raw_sl_dist, 5.0)
@@ -609,7 +611,11 @@ def run_backtest(
                 df_window=df_window,
             )
         else:
-            rr = 1.5
+            rr = 2.0  # raised from 1.5
+
+        # Minimum RR filter — skip trades where RR < 2.0
+        if rr < 2.0:
+            continue
 
         tp = (entry + risk * rr) if signal.signal_type == "BUY" else (entry - risk * rr)
 
@@ -852,8 +858,8 @@ def main() -> None:
                         help="Lot size (default: 0.01)")
     parser.add_argument("--balance",      type=float, default=439.0,
                         help="Starting balance in USD (default: 439)")
-    parser.add_argument("--confidence",   type=float, default=0.65,
-                        help="ML confidence threshold (default: 0.65)")
+    parser.add_argument("--confidence",   type=float, default=0.70,
+                        help="ML confidence threshold (default: 0.70)")
     parser.add_argument("--train-start",  type=str,   default="2020-01-01",
                         help="Training start date (default: 2020-01-01)")
     parser.add_argument("--train-end",    type=str,   default="2023-12-31",

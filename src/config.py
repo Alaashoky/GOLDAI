@@ -48,7 +48,7 @@ class SMCConfig:
 class MLConfig:
     """Machine Learning model configuration."""
     model_path: str = "models/xgboost_model.json"
-    confidence_threshold: float = 0.65  # Minimum AI confidence for entry
+    confidence_threshold: float = 0.70  # Minimum AI confidence for entry
     retrain_frequency_days: int = 7     # Retrain model every N days
     lookback_periods: int = 1000        # Training data lookback
 
